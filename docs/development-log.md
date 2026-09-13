@@ -40,3 +40,13 @@ This strongly indicates that the first block contains accelerometer data
 and the second block contains gyroscope data.
 
 The IMU can now be accessed directly by custom STM32 firmware.
+
+- Radio CE confirmed: PB6.
+- Complete radio interface:
+  - CSN: PA15
+  - SCK: PB3
+  - MISO: PB4
+  - MOSI: PB5
+  - CE: PB6
+ 
+  
