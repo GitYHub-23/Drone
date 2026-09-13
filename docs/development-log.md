@@ -23,23 +23,20 @@ All four replacement brushed motors were tested individually with the propellers
 
 ### M540 IMU reverse engineering
 
-The onboard IMU was identified as an M540 sensor.
+The onboard M540 motion sensor was successfully identified and accessed.
 
-After testing multiple GPIO combinations, the working I2C connection was found:
+Confirmed interface:
+- Interface: I2C
+- SCL: PB8
+- SDA: PB7
+- I2C address: 0x69
 
-- SCL -> PB8
-- SDA -> PB7
-- I2C address -> 0x69
+Register tests:
+- Register 0x75 returned 0x7D.
+- Registers 0x3B-0x40 responded to board tilt and movement.
+- Registers 0x43-0x48 responded to board rotation.
 
-The sensor successfully responded to register reads.
+This strongly indicates that the first block contains accelerometer data
+and the second block contains gyroscope data.
 
-WHO_AM_I register:
-- Register: 0x75
-- Returned value: 0x7D
-
-Motion register testing showed that:
-
-- 0x3B-0x40 changes with board tilt and movement, indicating accelerometer data.
-- 0x43-0x48 changes with board rotation, indicating gyroscope data.
-
-This confirms that the onboard M540 accelerometer and gyroscope can be accessed using custom STM32 firmware.
+The IMU can now be accessed directly by custom STM32 firmware.
