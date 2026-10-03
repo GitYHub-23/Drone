@@ -14,11 +14,10 @@
 
 #define REG32(addr) (*(volatile uint32_t *)(addr))
 
-#define MODER(base)  REG32((base) + 0x00U)
-#define OTYPER(base) REG32((base) + 0x04U)
-#define PUPDR(base)  REG32((base) + 0x0CU)
-#define IDR(base)    REG32((base) + 0x10U)
-#define BSRR(base)   REG32((base) + 0x18U)
+#define MODER(base) REG32((base) + 0x00U)
+#define PUPDR(base) REG32((base) + 0x0CU)
+#define IDR(base)   REG32((base) + 0x10U)
+#define BSRR(base)  REG32((base) + 0x18U)
 
 /* =========================================================
    SysTick
@@ -29,7 +28,7 @@
 #define SYST_CVR (*(volatile uint32_t *)0xE000E018U)
 
 /* =========================================================
-   Motors
+   Motors - CONFIRMED
    ========================================================= */
 
 #define M1_PIN 11U
@@ -38,27 +37,59 @@
 #define M4_PIN 10U
 
 /* =========================================================
-   M540 - confirmed
+   M540 IMU - CONFIRMED
    ========================================================= */
 
-#define M540_ADDRESS 0x69U
+#define IMU_PORT    GPIOB_BASE
+#define IMU_SDA_PIN 7U
+#define IMU_SCL_PIN 8U
 
-#define M540_SCL 8U      /* PB8 */
-#define M540_SDA 7U      /* PB7 */
-
-#define WHO_AM_I 0x75U
-
-/* MPU-like data registers */
-#define ACCEL_X_H 0x3BU
-#define ACCEL_Y_H 0x3DU
-#define ACCEL_Z_H 0x3FU
-
-#define GYRO_X_H  0x43U
-#define GYRO_Y_H  0x45U
-#define GYRO_Z_H  0x47U
+#define M540_ADDR 0x69U
 
 /* =========================================================
-   Delay
+   Variables for STM32CubeIDE Live Expressions
+   ========================================================= */
+
+volatile uint8_t imu_whoami = 0;
+
+volatile uint32_t imu_ok = 0;
+volatile uint32_t imu_read_ok = 0;
+volatile uint32_t imu_frame_counter = 0;
+
+/* Accelerometer */
+
+volatile int16_t accel_x = 0;
+volatile int16_t accel_y = 0;
+volatile int16_t accel_z = 0;
+
+/* Gyroscope */
+
+volatile int16_t gyro_x = 0;
+volatile int16_t gyro_y = 0;
+volatile int16_t gyro_z = 0;
+
+/* Temperature */
+
+volatile int16_t imu_temperature_raw = 0;
+
+/* =========================================================
+   Gyroscope peak recorder
+
+   Used to determine which physical movement corresponds
+   to raw gyro X / Y / Z.
+   ========================================================= */
+
+volatile int16_t gyro_x_min = 32767;
+volatile int16_t gyro_x_max = -32768;
+
+volatile int16_t gyro_y_min = 32767;
+volatile int16_t gyro_y_max = -32768;
+
+volatile int16_t gyro_z_min = 32767;
+volatile int16_t gyro_z_max = -32768;
+
+/* =========================================================
+   SysTick
    ========================================================= */
 
 static void systick_init(void)
@@ -76,298 +107,551 @@ static void delay_ms(uint32_t ms)
 {
     while (ms--)
     {
-        while ((SYST_CSR & (1U << 16)) == 0)
+        while ((SYST_CSR & (1U << 16)) == 0U)
         {
         }
     }
 }
 
+/* =========================================================
+   GPIO
+   ========================================================= */
+
+static void gpio_output(uint32_t port, uint32_t pin)
+{
+    MODER(port) &= ~(3U << (pin * 2U));
+    MODER(port) |=  (1U << (pin * 2U));
+}
+
+static void gpio_input_pullup(uint32_t port, uint32_t pin)
+{
+    MODER(port) &= ~(3U << (pin * 2U));
+
+    PUPDR(port) &= ~(3U << (pin * 2U));
+    PUPDR(port) |=  (1U << (pin * 2U));
+}
+
+static void gpio_high(uint32_t port, uint32_t pin)
+{
+    BSRR(port) = 1U << pin;
+}
+
+static void gpio_low(uint32_t port, uint32_t pin)
+{
+    BSRR(port) = 1U << (pin + 16U);
+}
+
+static uint32_t gpio_read(uint32_t port, uint32_t pin)
+{
+    return (IDR(port) >> pin) & 1U;
+}
+
+/* =========================================================
+   Software I2C
+
+   PB8 = SCL
+   PB7 = SDA
+
+   Open-drain emulation:
+
+   LOW  = GPIO output driving LOW
+   HIGH = GPIO input / released
+   ========================================================= */
+
 static void i2c_delay(void)
 {
-    for (volatile uint32_t i = 0; i < 150U; i++)
+    for (volatile uint32_t i = 0; i < 40U; i++)
     {
     }
 }
 
-/* =========================================================
-   GPIO A
-   ========================================================= */
-
-static void gpioa_output(uint32_t pin)
+static void sda_low(void)
 {
-    MODER(GPIOA_BASE) &= ~(3U << (pin * 2U));
-    MODER(GPIOA_BASE) |=  (1U << (pin * 2U));
+    gpio_low(IMU_PORT, IMU_SDA_PIN);
+    gpio_output(IMU_PORT, IMU_SDA_PIN);
 }
 
-static void gpioa_high(uint32_t pin)
+static void sda_release(void)
 {
-    BSRR(GPIOA_BASE) = 1U << pin;
-}
-
-static void gpioa_low(uint32_t pin)
-{
-    BSRR(GPIOA_BASE) = 1U << (pin + 16U);
-}
-
-/* =========================================================
-   GPIO B / I2C
-   ========================================================= */
-
-static void gpiob_open_drain(uint32_t pin)
-{
-    BSRR(GPIOB_BASE) = 1U << pin;
-
-    OTYPER(GPIOB_BASE) |= 1U << pin;
-
-    PUPDR(GPIOB_BASE) &= ~(3U << (pin * 2U));
-    PUPDR(GPIOB_BASE) |=  (1U << (pin * 2U));
-
-    MODER(GPIOB_BASE) &= ~(3U << (pin * 2U));
-    MODER(GPIOB_BASE) |=  (1U << (pin * 2U));
-}
-
-static void gpiob_high(uint32_t pin)
-{
-    BSRR(GPIOB_BASE) = 1U << pin;
-}
-
-static void gpiob_low(uint32_t pin)
-{
-    BSRR(GPIOB_BASE) = 1U << (pin + 16U);
-}
-
-static uint32_t gpiob_read(uint32_t pin)
-{
-    return (IDR(GPIOB_BASE) >> pin) & 1U;
-}
-
-/* =========================================================
-   I2C
-   ========================================================= */
-
-static void scl_high(void)
-{
-    gpiob_high(M540_SCL);
+    gpio_input_pullup(IMU_PORT, IMU_SDA_PIN);
 }
 
 static void scl_low(void)
 {
-    gpiob_low(M540_SCL);
+    gpio_low(IMU_PORT, IMU_SCL_PIN);
+    gpio_output(IMU_PORT, IMU_SCL_PIN);
 }
 
-static void sda_high(void)
+static void scl_release(void)
 {
-    gpiob_high(M540_SDA);
+    gpio_input_pullup(IMU_PORT, IMU_SCL_PIN);
 }
 
-static void sda_low(void)
+static void i2c_init(void)
 {
-    gpiob_low(M540_SDA);
-}
+    sda_release();
+    scl_release();
 
-static uint32_t sda_read(void)
-{
-    return gpiob_read(M540_SDA);
+    i2c_delay();
 }
 
 static void i2c_start(void)
 {
-    sda_high();
-    scl_high();
+    sda_release();
+    scl_release();
+
     i2c_delay();
 
     sda_low();
+
     i2c_delay();
 
     scl_low();
+
     i2c_delay();
 }
 
 static void i2c_stop(void)
 {
     sda_low();
+
     i2c_delay();
 
-    scl_high();
+    scl_release();
+
     i2c_delay();
 
-    sda_high();
+    sda_release();
+
     i2c_delay();
 }
 
+/* =========================================================
+   Send one I2C byte
+
+   return:
+   1 = ACK
+   0 = NO ACK
+   ========================================================= */
+
 static uint32_t i2c_write_byte(uint8_t value)
 {
-    for (uint32_t i = 0; i < 8; i++)
+    for (uint32_t i = 0; i < 8U; i++)
     {
         if (value & 0x80U)
-            sda_high();
+        {
+            sda_release();
+        }
         else
+        {
             sda_low();
+        }
 
         i2c_delay();
 
-        scl_high();
+        scl_release();
+
         i2c_delay();
 
         scl_low();
+
         i2c_delay();
 
         value <<= 1;
     }
 
-    /* ACK */
-    sda_high();
+    /* ACK bit */
+
+    sda_release();
+
     i2c_delay();
 
-    scl_high();
+    scl_release();
+
     i2c_delay();
 
     uint32_t ack =
-        (sda_read() == 0U);
+        (gpio_read(IMU_PORT, IMU_SDA_PIN) == 0U);
 
     scl_low();
+
     i2c_delay();
 
     return ack;
 }
 
-static uint8_t i2c_read_byte(uint32_t ack)
+/* =========================================================
+   Read one I2C byte
+
+   send_ack = 1 -> ACK
+   send_ack = 0 -> NACK
+   ========================================================= */
+
+static uint8_t i2c_read_byte(uint32_t send_ack)
 {
     uint8_t value = 0;
 
-    sda_high();
+    sda_release();
 
-    for (uint32_t i = 0; i < 8; i++)
+    for (uint32_t i = 0; i < 8U; i++)
     {
         value <<= 1;
 
-        scl_high();
+        scl_release();
+
         i2c_delay();
 
-        if (sda_read())
+        if (gpio_read(IMU_PORT, IMU_SDA_PIN))
+        {
             value |= 1U;
+        }
 
         scl_low();
+
         i2c_delay();
     }
 
-    if (ack)
+    if (send_ack)
+    {
         sda_low();
+    }
     else
-        sda_high();
+    {
+        sda_release();
+    }
 
     i2c_delay();
 
-    scl_high();
+    scl_release();
+
     i2c_delay();
 
     scl_low();
+
     i2c_delay();
 
-    sda_high();
+    sda_release();
 
     return value;
 }
 
 /* =========================================================
-   Register read
+   M540 - write one register
    ========================================================= */
 
-static uint32_t m540_read_register(
+static uint32_t m540_write_reg(
     uint8_t reg,
-    uint8_t *value)
+    uint8_t value)
 {
     i2c_start();
 
-    /* WRITE address */
+    /* M540 address + WRITE */
+
     if (!i2c_write_byte(
-        (uint8_t)(M540_ADDRESS << 1)))
+            (uint8_t)(M540_ADDR << 1)))
     {
         i2c_stop();
-        return 0;
+        return 0U;
     }
 
-    /* Register */
     if (!i2c_write_byte(reg))
     {
         i2c_stop();
-        return 0;
+        return 0U;
     }
 
-    /* Repeated START */
-    i2c_start();
-
-    /* READ address */
-    if (!i2c_write_byte(
-        (uint8_t)((M540_ADDRESS << 1) | 1U)))
+    if (!i2c_write_byte(value))
     {
         i2c_stop();
-        return 0;
+        return 0U;
     }
-
-    *value = i2c_read_byte(0);
 
     i2c_stop();
 
-    return 1;
+    return 1U;
 }
 
 /* =========================================================
-   Read signed 16-bit value
+   M540 - read multiple registers
    ========================================================= */
 
-static uint32_t m540_read_i16(
-    uint8_t high_register,
-    int32_t *result)
-{
-    uint8_t high;
-    uint8_t low;
-
-    if (!m540_read_register(
-        high_register, &high))
-        return 0;
-
-    if (!m540_read_register(
-        high_register + 1U, &low))
-        return 0;
-
-    int16_t value =
-        (int16_t)(
-            ((uint16_t)high << 8) |
-             (uint16_t)low);
-
-    *result = (int32_t)value;
-
-    return 1;
-}
-
-/* =========================================================
-   Motor signals
-   ========================================================= */
-
-static void motor_pulse(uint32_t pin)
-{
-    for (uint32_t i = 0; i < 20; i++)
-    {
-        gpioa_high(pin);
-        delay_ms(2);
-
-        gpioa_low(pin);
-        delay_ms(8);
-    }
-
-    gpioa_low(pin);
-}
-
-static void motor_signal(
-    uint32_t pin,
+static uint32_t m540_read_regs(
+    uint8_t reg,
+    uint8_t *data,
     uint32_t count)
 {
+    if (count == 0U)
+    {
+        return 0U;
+    }
+
+    /* Select starting register */
+
+    i2c_start();
+
+    if (!i2c_write_byte(
+            (uint8_t)(M540_ADDR << 1)))
+    {
+        i2c_stop();
+        return 0U;
+    }
+
+    if (!i2c_write_byte(reg))
+    {
+        i2c_stop();
+        return 0U;
+    }
+
+    /* Repeated START */
+
+    i2c_start();
+
+    /* M540 address + READ */
+
+    if (!i2c_write_byte(
+            (uint8_t)((M540_ADDR << 1) | 1U)))
+    {
+        i2c_stop();
+        return 0U;
+    }
+
     for (uint32_t i = 0; i < count; i++)
     {
-        motor_pulse(pin);
-        delay_ms(300);
+        /*
+           ACK every byte except the final byte.
+        */
+
+        data[i] =
+            i2c_read_byte(
+                i + 1U < count);
     }
+
+    i2c_stop();
+
+    return 1U;
+}
+
+/* =========================================================
+   M540 - read one register
+   ========================================================= */
+
+static uint32_t m540_read_reg(
+    uint8_t reg,
+    uint8_t *value)
+{
+    return m540_read_regs(
+        reg,
+        value,
+        1U);
+}
+
+/* =========================================================
+   M540 initialization
+   ========================================================= */
+
+static uint32_t m540_init(void)
+{
+    uint8_t id = 0;
+
+    /* -----------------------------------------------------
+       Reset
+       ----------------------------------------------------- */
+
+    if (!m540_write_reg(
+            0x6BU,
+            0x80U))
+    {
+        return 0U;
+    }
+
+    delay_ms(50);
+
+    /* -----------------------------------------------------
+       Wake sensor / clock
+       ----------------------------------------------------- */
+
+    if (!m540_write_reg(
+            0x6BU,
+            0x01U))
+    {
+        return 0U;
+    }
+
+    delay_ms(10);
+
+    /* -----------------------------------------------------
+       WHO_AM_I
+
+       Confirmed on our board:
+       register = 0x75
+       value    = 0x7D
+       ----------------------------------------------------- */
+
+    if (!m540_read_reg(
+            0x75U,
+            &id))
+    {
+        return 0U;
+    }
+
+    imu_whoami = id;
+
+    if (id != 0x7DU)
+    {
+        return 0U;
+    }
+
+    /* -----------------------------------------------------
+       Accelerometer +/-16g
+       ----------------------------------------------------- */
+
+    if (!m540_write_reg(
+            0x1CU,
+            0x18U))
+    {
+        return 0U;
+    }
+
+    /* -----------------------------------------------------
+       Accelerometer filter
+       ----------------------------------------------------- */
+
+    if (!m540_write_reg(
+            0x1DU,
+            0x05U))
+    {
+        return 0U;
+    }
+
+    /* -----------------------------------------------------
+       Gyroscope +/-2000 deg/s
+       ----------------------------------------------------- */
+
+    if (!m540_write_reg(
+            0x1BU,
+            0x18U))
+    {
+        return 0U;
+    }
+
+    /* -----------------------------------------------------
+       Gyroscope filter
+       ----------------------------------------------------- */
+
+    if (!m540_write_reg(
+            0x1AU,
+            0x00U))
+    {
+        return 0U;
+    }
+
+    delay_ms(10);
+
+    return 1U;
+}
+
+/* =========================================================
+   Read complete M540 measurement
+
+   0x3B-0x40 = accelerometer
+   0x41-0x42 = temperature
+   0x43-0x48 = gyroscope
+   ========================================================= */
+
+static uint32_t m540_read_raw(void)
+{
+    uint8_t data[14];
+
+    if (!m540_read_regs(
+            0x3BU,
+            data,
+            14U))
+    {
+        return 0U;
+    }
+
+    /* =====================================================
+       Accelerometer
+       ===================================================== */
+
+    accel_x =
+        (int16_t)(
+            ((uint16_t)data[0] << 8) |
+             data[1]);
+
+    accel_y =
+        (int16_t)(
+            ((uint16_t)data[2] << 8) |
+             data[3]);
+
+    accel_z =
+        (int16_t)(
+            ((uint16_t)data[4] << 8) |
+             data[5]);
+
+    /* =====================================================
+       Temperature
+       ===================================================== */
+
+    imu_temperature_raw =
+        (int16_t)(
+            ((uint16_t)data[6] << 8) |
+             data[7]);
+
+    /* =====================================================
+       Gyroscope
+       ===================================================== */
+
+    gyro_x =
+        (int16_t)(
+            ((uint16_t)data[8] << 8) |
+             data[9]);
+
+    gyro_y =
+        (int16_t)(
+            ((uint16_t)data[10] << 8) |
+             data[11]);
+
+    gyro_z =
+        (int16_t)(
+            ((uint16_t)data[12] << 8) |
+             data[13]);
+
+    /* =====================================================
+       Record gyro MIN / MAX
+       ===================================================== */
+
+    if (gyro_x < gyro_x_min)
+    {
+        gyro_x_min = gyro_x;
+    }
+
+    if (gyro_x > gyro_x_max)
+    {
+        gyro_x_max = gyro_x;
+    }
+
+    if (gyro_y < gyro_y_min)
+    {
+        gyro_y_min = gyro_y;
+    }
+
+    if (gyro_y > gyro_y_max)
+    {
+        gyro_y_max = gyro_y;
+    }
+
+    if (gyro_z < gyro_z_min)
+    {
+        gyro_z_min = gyro_z;
+    }
+
+    if (gyro_z > gyro_z_max)
+    {
+        gyro_z_max = gyro_z;
+    }
+
+    return 1U;
 }
 
 /* =========================================================
@@ -376,213 +660,95 @@ static void motor_signal(
 
 int main(void)
 {
-    uint8_t who = 0;
+    /* =====================================================
+       Enable GPIO clocks
+       ===================================================== */
 
-    RCC_AHBENR |= GPIOA_EN | GPIOB_EN;
+    RCC_AHBENR |=
+        GPIOA_EN |
+        GPIOB_EN;
 
-    /* Board power */
-    gpioa_high(1U);
-    gpioa_output(1U);
+    /* =====================================================
+       Board power
+       ===================================================== */
 
-    /* Motors OFF */
-    gpioa_low(M1_PIN);
-    gpioa_low(M2_PIN);
-    gpioa_low(M3_PIN);
-    gpioa_low(M4_PIN);
+    gpio_high(
+        GPIOA_BASE,
+        1U);
 
-    gpioa_output(M1_PIN);
-    gpioa_output(M2_PIN);
-    gpioa_output(M3_PIN);
-    gpioa_output(M4_PIN);
+    gpio_output(
+        GPIOA_BASE,
+        1U);
 
-    /* M540 bus */
-    gpiob_open_drain(M540_SCL);
-    gpiob_open_drain(M540_SDA);
+    /* =====================================================
+       Motors OFF
 
-    scl_high();
-    sda_high();
+       Motors must NOT run during this experiment.
+       ===================================================== */
+
+    gpio_low(GPIOA_BASE, M1_PIN);
+    gpio_low(GPIOA_BASE, M2_PIN);
+    gpio_low(GPIOA_BASE, M3_PIN);
+    gpio_low(GPIOA_BASE, M4_PIN);
+
+    gpio_output(GPIOA_BASE, M1_PIN);
+    gpio_output(GPIOA_BASE, M2_PIN);
+    gpio_output(GPIOA_BASE, M3_PIN);
+    gpio_output(GPIOA_BASE, M4_PIN);
+
+    /* =====================================================
+       Time
+       ===================================================== */
 
     systick_init();
 
-    /*
-       Put board on table and leave it still.
-    */
-    delay_ms(2000);
+    delay_ms(100);
 
-    /* Make sure sensor still responds */
-    if (!m540_read_register(WHO_AM_I, &who))
-    {
-        motor_signal(M4_PIN, 3);
+    /* =====================================================
+       I2C
+       ===================================================== */
 
-        while (1) {}
-    }
+    i2c_init();
 
-    /*
-       Previous test returned 0x7D.
-       If it suddenly changed, signal error.
-    */
-    if (who != 0x7DU)
-    {
-        motor_signal(M4_PIN, 3);
+    /* =====================================================
+       M540
+       ===================================================== */
 
-        while (1) {}
-    }
+    imu_ok = m540_init();
 
-    /*
-       Initial values.
-    */
-    int32_t ax, ay, az;
-    int32_t gx, gy, gz;
-
-    if (!m540_read_i16(ACCEL_X_H, &ax) ||
-        !m540_read_i16(ACCEL_Y_H, &ay) ||
-        !m540_read_i16(ACCEL_Z_H, &az) ||
-        !m540_read_i16(GYRO_X_H,  &gx) ||
-        !m540_read_i16(GYRO_Y_H,  &gy) ||
-        !m540_read_i16(GYRO_Z_H,  &gz))
-    {
-        motor_signal(M4_PIN, 3);
-
-        while (1) {}
-    }
-
-    /*
-       Start with current values as min/max.
-    */
-    int32_t min_ax = ax, max_ax = ax;
-    int32_t min_ay = ay, max_ay = ay;
-    int32_t min_az = az, max_az = az;
-
-    int32_t min_gx = gx, max_gx = gx;
-    int32_t min_gy = gy, max_gy = gy;
-    int32_t min_gz = gz, max_gz = gz;
-
-    /*
-       M4 x1 =
-       START MOVING THE BOARD NOW.
-    */
-    motor_signal(M4_PIN, 1);
-
-    /*
-       About 4 seconds.
-
-       During this time:
-       tilt it forward/back,
-       left/right,
-       and rotate it.
-    */
-    for (uint32_t sample = 0;
-         sample < 400U;
-         sample++)
-    {
-        if (!m540_read_i16(ACCEL_X_H, &ax) ||
-            !m540_read_i16(ACCEL_Y_H, &ay) ||
-            !m540_read_i16(ACCEL_Z_H, &az) ||
-            !m540_read_i16(GYRO_X_H,  &gx) ||
-            !m540_read_i16(GYRO_Y_H,  &gy) ||
-            !m540_read_i16(GYRO_Z_H,  &gz))
-        {
-            motor_signal(M4_PIN, 3);
-
-            while (1) {}
-        }
-
-        if (ax < min_ax) min_ax = ax;
-        if (ax > max_ax) max_ax = ax;
-
-        if (ay < min_ay) min_ay = ay;
-        if (ay > max_ay) max_ay = ay;
-
-        if (az < min_az) min_az = az;
-        if (az > max_az) max_az = az;
-
-        if (gx < min_gx) min_gx = gx;
-        if (gx > max_gx) max_gx = gx;
-
-        if (gy < min_gy) min_gy = gy;
-        if (gy > max_gy) max_gy = gy;
-
-        if (gz < min_gz) min_gz = gz;
-        if (gz > max_gz) max_gz = gz;
-
-        delay_ms(10);
-    }
-
-    /*
-       Calculate how much every channel moved.
-    */
-    int32_t accel_range_x = max_ax - min_ax;
-    int32_t accel_range_y = max_ay - min_ay;
-    int32_t accel_range_z = max_az - min_az;
-
-    int32_t gyro_range_x = max_gx - min_gx;
-    int32_t gyro_range_y = max_gy - min_gy;
-    int32_t gyro_range_z = max_gz - min_gz;
-
-    /*
-       Fairly conservative thresholds.
-       Real movement should exceed these
-       by a lot if these are the correct registers.
-    */
-    uint32_t accel_found =
-        (accel_range_x > 500) ||
-        (accel_range_y > 500) ||
-        (accel_range_z > 500);
-
-    uint32_t gyro_found =
-        (gyro_range_x > 200) ||
-        (gyro_range_y > 200) ||
-        (gyro_range_z > 200);
-
-    delay_ms(1000);
-
-    /*
-       RESULTS
-    */
-
-    if (accel_found && gyro_found)
-    {
-        /*
-           ACCEL works:
-           M3 x2
-
-           then GYRO works:
-           M2 x2
-        */
-        motor_signal(M3_PIN, 2);
-
-        delay_ms(1000);
-
-        motor_signal(M2_PIN, 2);
-    }
-    else if (accel_found)
-    {
-        /*
-           Only accel block changes.
-        */
-        motor_signal(M3_PIN, 2);
-    }
-    else if (gyro_found)
-    {
-        /*
-           Only gyro block changes.
-        */
-        motor_signal(M2_PIN, 2);
-    }
-    else
-    {
-        /*
-           Registers 0x3B-0x48 do not
-           behave like motion data.
-        */
-        motor_signal(M1_PIN, 3);
-    }
+    /* =====================================================
+       Main loop
+       ===================================================== */
 
     while (1)
     {
-        gpioa_low(M1_PIN);
-        gpioa_low(M2_PIN);
-        gpioa_low(M3_PIN);
-        gpioa_low(M4_PIN);
+        if (imu_ok)
+        {
+            imu_read_ok =
+                m540_read_raw();
+
+            if (imu_read_ok)
+            {
+                imu_frame_counter++;
+            }
+        }
+        else
+        {
+            /*
+               Initialization failed.
+               Retry once per second.
+            */
+
+            delay_ms(1000);
+
+            imu_ok =
+                m540_init();
+        }
+
+        /*
+           Approximately 50 Hz for this test.
+        */
+
+        delay_ms(20);
     }
 }
