@@ -1,44 +1,35 @@
 #include <stdint.h>
 
 /* =========================================================
-   DRONE FLIGHT CONTROLLER - STEP 1
-
-   MCU:
-       STM32F031K4
+   DRONE_ - FLIGHT CONTROLLER STEP 2
+   STM32F031 + M540 + TIM1
 
    IMU:
-       M540
        PB8 = SCL
        PB7 = SDA
-       I2C address = 0x69
+       address = 0x69
        WHO_AM_I = 0x7D
 
-   MOTOR PWM:
-       PA8  -> TIM1_CH1 -> M3
-       PA9  -> TIM1_CH2 -> M2
-       PA10 -> TIM1_CH3 -> M4
-       PA11 -> TIM1_CH4 -> M1
+   MOTORS:
+       PA8  TIM1_CH1 -> M3
+       PA9  TIM1_CH2 -> M2
+       PA10 TIM1_CH3 -> M4
+       PA11 TIM1_CH4 -> M1
 
-   CURRENT FEATURES:
-       - M540 initialization
-       - accelerometer reading
-       - gyroscope reading
-       - automatic gyro calibration
-       - gyro bias correction
-       - Roll angle
-       - Pitch angle
-       - Yaw rate / integrated yaw
-       - TIM1 initialized
-       - ALL MOTORS FORCED OFF
+   STEP 2:
+       - faster software I2C
+       - target attitude loop = 200 Hz
+       - gyro calibration
+       - Roll / Pitch complementary filter
+       - loop timing diagnostics
+       - I2C error diagnostics
 
-   IMPORTANT:
-       REMOVE PROPELLERS
-       KEEP DRONE STILL DURING CALIBRATION
+   MOTORS ARE FORCED TO 0%
    ========================================================= */
 
 
 /* =========================================================
-   Register access
+   Register helper
    ========================================================= */
 
 #define REG32(addr) (*(volatile uint32_t *)(addr))
@@ -54,9 +45,7 @@
 
 #define GPIOA_EN        (1U << 17)
 #define GPIOB_EN        (1U << 18)
-
 #define TIM1_EN         (1U << 11)
-#define DBGMCU_EN       (1U << 22)
 
 
 /* =========================================================
@@ -66,13 +55,13 @@
 #define GPIOA_BASE      0x48000000U
 #define GPIOB_BASE      0x48000400U
 
-#define MODER(base)     REG32((base) + 0x00U)
-#define OTYPER(base)    REG32((base) + 0x04U)
-#define OSPEEDR(base)   REG32((base) + 0x08U)
-#define PUPDR(base)     REG32((base) + 0x0CU)
-#define IDR(base)       REG32((base) + 0x10U)
-#define BSRR(base)      REG32((base) + 0x18U)
-#define AFRH(base)      REG32((base) + 0x24U)
+#define GPIO_MODER(p)   REG32((p) + 0x00U)
+#define GPIO_OTYPER(p)  REG32((p) + 0x04U)
+#define GPIO_OSPEEDR(p) REG32((p) + 0x08U)
+#define GPIO_PUPDR(p)   REG32((p) + 0x0CU)
+#define GPIO_IDR(p)     REG32((p) + 0x10U)
+#define GPIO_BSRR(p)    REG32((p) + 0x18U)
+#define GPIO_AFRH(p)    REG32((p) + 0x24U)
 
 
 /* =========================================================
@@ -115,15 +104,6 @@
 
 
 /* =========================================================
-   Debug
-   ========================================================= */
-
-#define DBGMCU_APB2_FZ  REG32(0x4001580CU)
-
-#define DBG_TIM1_STOP   (1U << 11)
-
-
-/* =========================================================
    M540
    ========================================================= */
 
@@ -136,21 +116,41 @@
 
 
 /* =========================================================
-   Motors
+   Timing
    ========================================================= */
 
-#define MOTOR_M1        1U
-#define MOTOR_M2        2U
-#define MOTOR_M3        3U
-#define MOTOR_M4        4U
+/*
+   CPU currently remains at the already-working 8 MHz.
+
+   SysTick:
+       8 MHz / 8000 = 1 kHz
+       = 1 ms
+*/
+
+#define LOOP_PERIOD_MS  5U
+
+/*
+   5 ms = 200 Hz target flight loop
+*/
+
+
+/* =========================================================
+   Software I2C speed
+
+   Previous stable version:
+       40 iterations
+
+   Step 2:
+       8 iterations
+
+   We do NOT jump directly to extremely fast timing.
+   ========================================================= */
+
+#define SOFT_I2C_DELAY_COUNT 8U
 
 
 /* =========================================================
    PWM
-
-   We keep the already physically tested 1 kHz PWM.
-
-   8 MHz / 8000 = 1000 Hz
    ========================================================= */
 
 #define PWM_PERIOD      8000U
@@ -158,26 +158,15 @@
 
 
 /* =========================================================
-   Sensor constants
+   Sensor scale
    ========================================================= */
 
-/*
-   Accelerometer is configured for +/-16g.
-
-   Our physical tests already showed:
-       ~2048 raw = 1g
-*/
-
-#define ACCEL_LSB_PER_G 2048.0f
-
+#define ACCEL_LSB_PER_G  2048.0f
 
 /*
-   Gyro register is configured as +/-2000 deg/s.
+   Temporary working gyro scale.
 
-   16.4 LSB/(deg/s) is currently used as the MPU-compatible
-   scale.
-
-   We will verify the exact M540 scale experimentally later.
+   We will calibrate this later experimentally.
 */
 
 #define GYRO_LSB_PER_DPS 16.4f
@@ -185,14 +174,16 @@
 
 /* =========================================================
    Complementary filter
+
+   At ~200 Hz use 0.99 instead of old 0.98.
    ========================================================= */
 
-#define FILTER_GYRO_WEIGHT  0.98f
-#define FILTER_ACCEL_WEIGHT 0.02f
+#define FILTER_ALPHA       0.99f
+#define FILTER_ACCEL_ALPHA 0.01f
 
 
 /* =========================================================
-   Time
+   Global system time
    ========================================================= */
 
 volatile uint32_t system_ms = 0;
@@ -202,11 +193,16 @@ volatile uint32_t system_ms = 0;
    IMU status
    ========================================================= */
 
+volatile uint32_t imu_ok = 0;
 volatile uint8_t imu_whoami = 0;
 
-volatile uint32_t imu_ok = 0;
 volatile uint32_t imu_read_ok = 0;
+
 volatile uint32_t imu_frame_counter = 0;
+
+volatile uint32_t imu_error_counter = 0;
+
+volatile uint32_t imu_consecutive_errors = 0;
 
 
 /* =========================================================
@@ -235,14 +231,15 @@ volatile int16_t imu_temperature_raw = 0;
 
 
 /* =========================================================
-   Gyro calibration
-
-   status:
-       0 = not started
-       1 = calibrating
-       2 = calibration complete
-       3 = calibration failed
+   Calibration
    ========================================================= */
+
+/*
+   0 = not started
+   1 = calibrating
+   2 = complete
+   3 = failed
+*/
 
 volatile uint32_t calibration_status = 0;
 
@@ -254,17 +251,12 @@ volatile float gyro_z_offset = 0.0f;
 
 
 /* =========================================================
-   Corrected gyro RAW values
+   Corrected gyro
    ========================================================= */
 
 volatile float gyro_roll_raw = 0.0f;
 volatile float gyro_pitch_raw = 0.0f;
 volatile float gyro_yaw_raw = 0.0f;
-
-
-/* =========================================================
-   Gyroscope deg/s
-   ========================================================= */
 
 volatile float gyro_roll_dps = 0.0f;
 volatile float gyro_pitch_dps = 0.0f;
@@ -272,49 +264,65 @@ volatile float gyro_yaw_dps = 0.0f;
 
 
 /* =========================================================
-   Accelerometer in g
+   Accelerometer
    ========================================================= */
 
 volatile float accel_x_g = 0.0f;
 volatile float accel_y_g = 0.0f;
 volatile float accel_z_g = 0.0f;
 
-
-/* =========================================================
-   Accelerometer-only angles
-   ========================================================= */
-
 volatile float accel_roll_deg = 0.0f;
 volatile float accel_pitch_deg = 0.0f;
 
 
 /* =========================================================
-   Fused attitude
-
-   THESE ARE THE INTERESTING VARIABLES :)
+   Attitude
    ========================================================= */
 
 volatile float roll_angle = 0.0f;
 volatile float pitch_angle = 0.0f;
-
 volatile float yaw_angle = 0.0f;
-
-
-/* =========================================================
-   Attitude state
-   ========================================================= */
 
 volatile uint32_t attitude_initialized = 0;
 
-volatile float loop_dt = 0.0f;
+
+/* =========================================================
+   LOOP DIAGNOSTICS
+   ========================================================= */
 
 volatile uint32_t flight_loop_counter = 0;
+
+/*
+   Actual time between attitude updates.
+*/
+
+volatile uint32_t loop_dt_ms = 0;
+
+volatile float loop_dt = 0.0f;
+
+volatile float loop_hz = 0.0f;
+
+
+/*
+   Maximum observed dt after startup.
+*/
+
+volatile uint32_t loop_dt_max_ms = 0;
+
+
+/*
+   Approximate time required for one IMU read.
+*/
+
+volatile uint32_t imu_read_time_ms = 0;
+
+volatile uint32_t imu_read_time_max_ms = 0;
 
 
 /* =========================================================
    Motors
 
-   They MUST remain zero in this firmware.
+   MUST REMAIN ZERO
    ========================================================= */
 
 volatile uint32_t motor1_percent = 0;
@@ -324,9 +332,7 @@ volatile uint32_t motor4_percent = 0;
 
 
 /* =========================================================
-   SysTick interrupt
-
-   Called every 1 ms.
+   SysTick ISR
    ========================================================= */
 
 void SysTick_Handler(void)
@@ -336,19 +342,11 @@ void SysTick_Handler(void)
 
 
 /* =========================================================
-   SysTick initialization
+   SysTick init
    ========================================================= */
 
 static void systick_init(void)
 {
-    /*
-       CPU = 8 MHz
-
-       8,000,000 / 8000 = 1000 Hz
-
-       interrupt every 1 ms
-    */
-
     SYST_CSR = 0U;
 
     SYST_RVR = 7999U;
@@ -357,13 +355,13 @@ static void systick_init(void)
 
     SYST_CSR =
         (1U << 2) |     /* CPU clock */
-        (1U << 1) |     /* interrupt enable */
-        (1U << 0);      /* SysTick enable */
+        (1U << 1) |     /* interrupt */
+        (1U << 0);      /* enable */
 }
 
 
 /* =========================================================
-   Millisecond delay
+   Delay
    ========================================================= */
 
 static void delay_ms(uint32_t ms)
@@ -380,56 +378,47 @@ static void delay_ms(uint32_t ms)
    GPIO helpers
    ========================================================= */
 
-static void gpio_output(
-    uint32_t port,
-    uint32_t pin)
+static void gpio_output(uint32_t port, uint32_t pin)
 {
-    MODER(port) &= ~(3U << (pin * 2U));
+    GPIO_MODER(port) &=
+        ~(3U << (pin * 2U));
 
-    MODER(port) |=
+    GPIO_MODER(port) |=
         (1U << (pin * 2U));
 }
 
 
-static void gpio_input_pullup(
-    uint32_t port,
-    uint32_t pin)
+static void gpio_input_pullup(uint32_t port, uint32_t pin)
 {
-    MODER(port) &=
+    GPIO_MODER(port) &=
         ~(3U << (pin * 2U));
 
-    PUPDR(port) &=
+    GPIO_PUPDR(port) &=
         ~(3U << (pin * 2U));
 
-    PUPDR(port) |=
+    GPIO_PUPDR(port) |=
         (1U << (pin * 2U));
 }
 
 
-static void gpio_high(
-    uint32_t port,
-    uint32_t pin)
+static void gpio_high(uint32_t port, uint32_t pin)
 {
-    BSRR(port) =
+    GPIO_BSRR(port) =
         (1U << pin);
 }
 
 
-static void gpio_low(
-    uint32_t port,
-    uint32_t pin)
+static void gpio_low(uint32_t port, uint32_t pin)
 {
-    BSRR(port) =
+    GPIO_BSRR(port) =
         (1U << (pin + 16U));
 }
 
 
-static uint32_t gpio_read(
-    uint32_t port,
-    uint32_t pin)
+static uint32_t gpio_read(uint32_t port, uint32_t pin)
 {
     return
-        (IDR(port) >> pin) & 1U;
+        (GPIO_IDR(port) >> pin) & 1U;
 }
 
 
@@ -439,11 +428,15 @@ static uint32_t gpio_read(
 
 static void i2c_delay(void)
 {
-    for (volatile uint32_t i = 0; i < 40U; i++)
+    for (volatile uint32_t i = 0;
+         i < SOFT_I2C_DELAY_COUNT;
+         i++)
     {
     }
 }
 
+
+/* SDA LOW */
 
 static void sda_low(void)
 {
@@ -457,6 +450,8 @@ static void sda_low(void)
 }
 
 
+/* SDA released HIGH */
+
 static void sda_release(void)
 {
     gpio_input_pullup(
@@ -464,6 +459,8 @@ static void sda_release(void)
         IMU_SDA_PIN);
 }
 
+
+/* SCL LOW */
 
 static void scl_low(void)
 {
@@ -476,6 +473,8 @@ static void scl_low(void)
         IMU_SCL_PIN);
 }
 
+
+/* SCL released HIGH */
 
 static void scl_release(void)
 {
@@ -528,12 +527,14 @@ static void i2c_stop(void)
 
 
 /* =========================================================
-   I2C write
+   Write one byte
    ========================================================= */
 
 static uint32_t i2c_write_byte(uint8_t value)
 {
-    for (uint32_t i = 0; i < 8U; i++)
+    for (uint32_t i = 0;
+         i < 8U;
+         i++)
     {
         if (value & 0x80U)
         {
@@ -544,6 +545,7 @@ static uint32_t i2c_write_byte(uint8_t value)
             sda_low();
         }
 
+
         i2c_delay();
 
         scl_release();
@@ -553,6 +555,7 @@ static uint32_t i2c_write_byte(uint8_t value)
         scl_low();
 
         i2c_delay();
+
 
         value <<= 1;
     }
@@ -579,23 +582,26 @@ static uint32_t i2c_write_byte(uint8_t value)
 
     i2c_delay();
 
+
     return ack;
 }
 
 
 /* =========================================================
-   I2C read
+   Read one byte
    ========================================================= */
 
 static uint8_t i2c_read_byte(uint32_t send_ack)
 {
-    uint8_t value = 0;
+    uint8_t value = 0U;
 
 
     sda_release();
 
 
-    for (uint32_t i = 0; i < 8U; i++)
+    for (uint32_t i = 0;
+         i < 8U;
+         i++)
     {
         value <<= 1;
 
@@ -647,7 +653,7 @@ static uint8_t i2c_read_byte(uint32_t send_ack)
 
 
 /* =========================================================
-   M540 write register
+   M540 write
    ========================================================= */
 
 static uint32_t m540_write_reg(
@@ -661,7 +667,6 @@ static uint32_t m540_write_reg(
             (uint8_t)(M540_ADDR << 1)))
     {
         i2c_stop();
-
         return 0U;
     }
 
@@ -669,7 +674,6 @@ static uint32_t m540_write_reg(
     if (!i2c_write_byte(reg))
     {
         i2c_stop();
-
         return 0U;
     }
 
@@ -677,20 +681,18 @@ static uint32_t m540_write_reg(
     if (!i2c_write_byte(value))
     {
         i2c_stop();
-
         return 0U;
     }
 
 
     i2c_stop();
 
-
     return 1U;
 }
 
 
 /* =========================================================
-   M540 read registers
+   M540 read multiple
    ========================================================= */
 
 static uint32_t m540_read_regs(
@@ -704,8 +706,6 @@ static uint32_t m540_read_regs(
     }
 
 
-    /* Starting register */
-
     i2c_start();
 
 
@@ -713,7 +713,6 @@ static uint32_t m540_read_regs(
             (uint8_t)(M540_ADDR << 1)))
     {
         i2c_stop();
-
         return 0U;
     }
 
@@ -721,12 +720,11 @@ static uint32_t m540_read_regs(
     if (!i2c_write_byte(reg))
     {
         i2c_stop();
-
         return 0U;
     }
 
 
-    /* Repeated START */
+    /* repeated START */
 
     i2c_start();
 
@@ -735,12 +733,13 @@ static uint32_t m540_read_regs(
             (uint8_t)((M540_ADDR << 1) | 1U)))
     {
         i2c_stop();
-
         return 0U;
     }
 
 
-    for (uint32_t i = 0; i < count; i++)
+    for (uint32_t i = 0;
+         i < count;
+         i++)
     {
         data[i] =
             i2c_read_byte(
@@ -750,14 +749,9 @@ static uint32_t m540_read_regs(
 
     i2c_stop();
 
-
     return 1U;
 }
 
-
-/* =========================================================
-   M540 read one register
-   ========================================================= */
 
 static uint32_t m540_read_reg(
     uint8_t reg,
@@ -777,10 +771,10 @@ static uint32_t m540_read_reg(
 
 static uint32_t m540_init(void)
 {
-    uint8_t id = 0;
+    uint8_t id = 0U;
 
 
-    /* Reset */
+    /* reset */
 
     if (!m540_write_reg(
             0x6BU,
@@ -793,7 +787,7 @@ static uint32_t m540_init(void)
     delay_ms(50);
 
 
-    /* Wake */
+    /* wake */
 
     if (!m540_write_reg(
             0x6BU,
@@ -825,7 +819,7 @@ static uint32_t m540_init(void)
     }
 
 
-    /* Accelerometer +/-16g */
+    /* accel +/-16g */
 
     if (!m540_write_reg(
             0x1CU,
@@ -835,7 +829,7 @@ static uint32_t m540_init(void)
     }
 
 
-    /* Accelerometer filter */
+    /* accel filter */
 
     if (!m540_write_reg(
             0x1DU,
@@ -845,7 +839,7 @@ static uint32_t m540_init(void)
     }
 
 
-    /* Gyroscope +/-2000 deg/s */
+    /* gyro +/-2000 */
 
     if (!m540_write_reg(
             0x1BU,
@@ -855,7 +849,7 @@ static uint32_t m540_init(void)
     }
 
 
-    /* Gyroscope filter */
+    /* gyro filter */
 
     if (!m540_write_reg(
             0x1AU,
@@ -873,7 +867,7 @@ static uint32_t m540_init(void)
 
 
 /* =========================================================
-   M540 raw measurement
+   Read M540 raw frame
    ========================================================= */
 
 static uint32_t m540_read_raw(void)
@@ -889,8 +883,6 @@ static uint32_t m540_read_raw(void)
         return 0U;
     }
 
-
-    /* Accelerometer */
 
     accel_x =
         (int16_t)(
@@ -910,15 +902,11 @@ static uint32_t m540_read_raw(void)
              data[5]);
 
 
-    /* Temperature */
-
     imu_temperature_raw =
         (int16_t)(
             ((uint16_t)data[6] << 8) |
              data[7]);
 
-
-    /* Gyroscope */
 
     gyro_x =
         (int16_t)(
@@ -943,68 +931,54 @@ static uint32_t m540_read_raw(void)
 
 
 /* =========================================================
-   TIM1 motor GPIO
+   MOTOR GPIO
    ========================================================= */
 
 static void motor_gpio_init(void)
 {
-    /* Push-pull */
+    /* push-pull */
 
-    OTYPER(GPIOA_BASE) &=
+    GPIO_OTYPER(GPIOA_BASE) &=
         ~(
-            (1U << 8)  |
-            (1U << 9)  |
+            (1U << 8) |
+            (1U << 9) |
             (1U << 10) |
             (1U << 11)
         );
 
 
-    /* High speed */
+    /* high speed */
 
     for (uint32_t pin = 8U;
          pin <= 11U;
          pin++)
     {
-        OSPEEDR(GPIOA_BASE) &=
+        GPIO_OSPEEDR(GPIOA_BASE) &=
             ~(3U << (pin * 2U));
 
-        OSPEEDR(GPIOA_BASE) |=
+        GPIO_OSPEEDR(GPIOA_BASE) |=
             (3U << (pin * 2U));
-    }
 
 
-    /* No pull */
-
-    for (uint32_t pin = 8U;
-         pin <= 11U;
-         pin++)
-    {
-        PUPDR(GPIOA_BASE) &=
-            ~(3U << (pin * 2U));
-    }
-
-
-    /* Alternate function */
-
-    for (uint32_t pin = 8U;
-         pin <= 11U;
-         pin++)
-    {
-        MODER(GPIOA_BASE) &=
+        GPIO_PUPDR(GPIOA_BASE) &=
             ~(3U << (pin * 2U));
 
-        MODER(GPIOA_BASE) |=
+
+        GPIO_MODER(GPIOA_BASE) &=
+            ~(3U << (pin * 2U));
+
+        GPIO_MODER(GPIOA_BASE) |=
             (2U << (pin * 2U));
     }
 
 
-    /* AF2 */
+    /* PA8-PA11 = AF2 */
 
-    AFRH(GPIOA_BASE) &=
+    GPIO_AFRH(GPIOA_BASE) &=
         ~0x0000FFFFU;
 
 
-    AFRH(GPIOA_BASE) |=
+    GPIO_AFRH(GPIOA_BASE) |=
         (2U << 0)  |
         (2U << 4)  |
         (2U << 8)  |
@@ -1013,7 +987,7 @@ static void motor_gpio_init(void)
 
 
 /* =========================================================
-   TIM1 PWM
+   TIM1 PWM initialization
    ========================================================= */
 
 static void tim1_pwm_init(void)
@@ -1023,15 +997,12 @@ static void tim1_pwm_init(void)
     (void)RCC_APB2ENR;
 
 
-    /* Reset TIM1 */
-
     RCC_APB2RSTR |= TIM1_EN;
-
     RCC_APB2RSTR &= ~TIM1_EN;
 
 
-    TIM1_CR1 = 0U;
-    TIM1_CR2 = 0U;
+    TIM1_CR1  = 0U;
+    TIM1_CR2  = 0U;
     TIM1_SMCR = 0U;
     TIM1_DIER = 0U;
 
@@ -1039,19 +1010,13 @@ static void tim1_pwm_init(void)
     TIM1_BDTR = 0U;
 
 
-    /* 1 kHz */
-
     TIM1_PSC = 0U;
-
-    TIM1_ARR =
-        PWM_ARR_VALUE;
-
+    TIM1_ARR = PWM_ARR_VALUE;
     TIM1_RCR = 0U;
-
     TIM1_CNT = 0U;
 
 
-    /* ALL MOTORS OFF */
+    /* motors OFF */
 
     TIM1_CCR1 = 0U;
     TIM1_CCR2 = 0U;
@@ -1059,34 +1024,34 @@ static void tim1_pwm_init(void)
     TIM1_CCR4 = 0U;
 
 
-    /* CH1 + CH2 */
+    /* CH1 + CH2 PWM mode 1 */
 
     TIM1_CCMR1 =
-        (6U << 4)  |
-        (1U << 3)  |
+        (6U << 4) |
+        (1U << 3) |
         (6U << 12) |
         (1U << 11);
 
 
-    /* CH3 + CH4 */
+    /* CH3 + CH4 PWM mode 1 */
 
     TIM1_CCMR2 =
-        (6U << 4)  |
-        (1U << 3)  |
+        (6U << 4) |
+        (1U << 3) |
         (6U << 12) |
         (1U << 11);
 
 
-    /* Enable all four outputs */
+    /* enable CH1-CH4 */
 
     TIM1_CCER =
-        (1U << 0)  |
-        (1U << 4)  |
-        (1U << 8)  |
+        (1U << 0) |
+        (1U << 4) |
+        (1U << 8) |
         (1U << 12);
 
 
-    /* Main Output Enable */
+    /* MOE */
 
     TIM1_BDTR =
         (1U << 15);
@@ -1098,10 +1063,9 @@ static void tim1_pwm_init(void)
         (1U << 7);
 
 
-    /* Update */
-
     TIM1_EGR =
         (1U << 0);
+
 
     TIM1_SR = 0U;
 
@@ -1109,108 +1073,35 @@ static void tim1_pwm_init(void)
     motor_gpio_init();
 
 
-    /* Start TIM1 */
-
     TIM1_CR1 |=
         (1U << 0);
 }
 
 
 /* =========================================================
-   Motor set
-   ========================================================= */
-
-static void motor_set(
-    uint32_t motor,
-    uint32_t percent)
-{
-    if (percent > 100U)
-    {
-        percent = 100U;
-    }
-
-
-    uint32_t pwm =
-        (PWM_PERIOD * percent) / 100U;
-
-
-    switch (motor)
-    {
-        /* M1 = PA11 = CH4 */
-
-        case MOTOR_M1:
-
-            TIM1_CCR4 = pwm;
-            motor1_percent = percent;
-
-            break;
-
-
-        /* M2 = PA9 = CH2 */
-
-        case MOTOR_M2:
-
-            TIM1_CCR2 = pwm;
-            motor2_percent = percent;
-
-            break;
-
-
-        /* M3 = PA8 = CH1 */
-
-        case MOTOR_M3:
-
-            TIM1_CCR1 = pwm;
-            motor3_percent = percent;
-
-            break;
-
-
-        /* M4 = PA10 = CH3 */
-
-        case MOTOR_M4:
-
-            TIM1_CCR3 = pwm;
-            motor4_percent = percent;
-
-            break;
-
-
-        default:
-
-            break;
-    }
-}
-
-
-/* =========================================================
    Motors OFF
+
+   We write CCR registers directly because STEP 2
+   does NOT allow motor operation.
    ========================================================= */
 
 static void motor_all_off(void)
 {
-    motor_set(
-        MOTOR_M1,
-        0U);
+    TIM1_CCR1 = 0U;
+    TIM1_CCR2 = 0U;
+    TIM1_CCR3 = 0U;
+    TIM1_CCR4 = 0U;
 
-    motor_set(
-        MOTOR_M2,
-        0U);
 
-    motor_set(
-        MOTOR_M3,
-        0U);
-
-    motor_set(
-        MOTOR_M4,
-        0U);
+    motor1_percent = 0U;
+    motor2_percent = 0U;
+    motor3_percent = 0U;
+    motor4_percent = 0U;
 }
 
 
 /* =========================================================
    Integer square root
-
-   Avoids large math library on our small STM32F031K4.
    ========================================================= */
 
 static uint32_t integer_sqrt(uint32_t value)
@@ -1253,11 +1144,6 @@ static uint32_t integer_sqrt(uint32_t value)
 
 /* =========================================================
    Fast atan2 approximation
-
-   Returns angle in degrees.
-
-   This avoids linking the full math library.
-   Accuracy is sufficient for our current bring-up.
    ========================================================= */
 
 static float fast_atan2_deg(
@@ -1280,11 +1166,8 @@ static float fast_atan2_deg(
         : y;
 
 
-    /*
-       Prevent 0 / 0.
-    */
-
-    abs_y += 0.000001f;
+    abs_y +=
+        0.000001f;
 
 
     float r;
@@ -1328,12 +1211,7 @@ static float fast_atan2_deg(
 
 
 /* =========================================================
-   Gyroscope calibration
-
-   Drone MUST remain completely still.
-
-   500 samples x 5 ms
-   ~2.5 seconds
+   Gyro calibration
    ========================================================= */
 
 static uint32_t gyro_calibrate(void)
@@ -1342,8 +1220,7 @@ static uint32_t gyro_calibrate(void)
     int32_t sum_y = 0;
     int32_t sum_z = 0;
 
-
-    uint32_t valid = 0;
+    uint32_t valid = 0U;
 
 
     calibration_status = 1U;
@@ -1351,7 +1228,14 @@ static uint32_t gyro_calibrate(void)
     calibration_samples = 0U;
 
 
-    for (uint32_t i = 0;
+    /*
+       500 samples.
+
+       At faster I2C this now takes much less time.
+       3 ms gap keeps calibration calm and predictable.
+    */
+
+    for (uint32_t i = 0U;
          i < 500U;
          i++)
     {
@@ -1374,13 +1258,9 @@ static uint32_t gyro_calibrate(void)
         }
 
 
-        delay_ms(5);
+        delay_ms(3U);
     }
 
-
-    /*
-       Require at least 450 valid samples.
-    */
 
     if (valid < 450U)
     {
@@ -1413,13 +1293,13 @@ static uint32_t gyro_calibrate(void)
 
 
 /* =========================================================
-   Calculate attitude
+   ATTITUDE UPDATE
    ========================================================= */
 
 static void attitude_update(float dt)
 {
     /* =====================================================
-       Convert accelerometer to g
+       Accelerometer -> g
        ===================================================== */
 
     accel_x_g =
@@ -1438,13 +1318,7 @@ static void attitude_update(float dt)
 
 
     /* =====================================================
-       Correct gyro bias
-
-       Confirmed physical mapping:
-
-       raw X = ROLL
-       raw Y = PITCH
-       raw Z = YAW
+       Correct gyro offsets
        ===================================================== */
 
     gyro_roll_raw =
@@ -1463,7 +1337,7 @@ static void attitude_update(float dt)
 
 
     /* =====================================================
-       Convert gyro to degrees per second
+       raw -> deg/s
        ===================================================== */
 
     gyro_roll_dps =
@@ -1482,16 +1356,13 @@ static void attitude_update(float dt)
 
 
     /* =====================================================
-       Accelerometer Roll
+       Accelerometer ROLL
 
-       Level:
-           Y ~= 0
-           Z ~= +2048
-           roll ~= 0
+       IMPORTANT:
+       We are deliberately NOT changing the sign yet.
 
-       Right side down:
-           Y positive
-           roll positive
+       Exact physical orientation test will determine
+       final FC convention.
        ===================================================== */
 
     accel_roll_deg =
@@ -1501,11 +1372,7 @@ static void attitude_update(float dt)
 
 
     /* =====================================================
-       Accelerometer Pitch
-
-       Need sqrt(Y^2 + Z^2).
-
-       Scale values by 2 first to prevent overflow.
+       Accelerometer PITCH
        ===================================================== */
 
     int32_t ay =
@@ -1531,12 +1398,6 @@ static void attitude_update(float dt)
         2.0f;
 
 
-    /*
-       Nose down produced raw X negative in our test.
-
-       Therefore -X gives positive pitch for nose-down.
-    */
-
     accel_pitch_deg =
         fast_atan2_deg(
             -(float)accel_x,
@@ -1544,9 +1405,7 @@ static void attitude_update(float dt)
 
 
     /* =====================================================
-       First frame
-
-       Initialize filter directly from accelerometer.
+       First attitude frame
        ===================================================== */
 
     if (!attitude_initialized)
@@ -1570,7 +1429,7 @@ static void attitude_update(float dt)
 
 
     /* =====================================================
-       Integrate gyro
+       Gyro prediction
        ===================================================== */
 
     float gyro_roll_angle =
@@ -1585,52 +1444,44 @@ static void attitude_update(float dt)
 
     /* =====================================================
        Complementary filter
-
-       Gyro:
-           fast / smooth motion
-
-       Accelerometer:
-           long-term reference to gravity
        ===================================================== */
 
     roll_angle =
-        FILTER_GYRO_WEIGHT *
+        FILTER_ALPHA *
         gyro_roll_angle +
 
-        FILTER_ACCEL_WEIGHT *
+        FILTER_ACCEL_ALPHA *
         accel_roll_deg;
 
 
     pitch_angle =
-        FILTER_GYRO_WEIGHT *
+        FILTER_ALPHA *
         gyro_pitch_angle +
 
-        FILTER_ACCEL_WEIGHT *
+        FILTER_ACCEL_ALPHA *
         accel_pitch_deg;
 
 
     /* =====================================================
-       Yaw
-
-       No magnetometer exists in our current system,
-       therefore yaw can only be integrated from gyro.
-
-       It WILL slowly drift. That is normal.
+       Yaw integration
        ===================================================== */
 
     yaw_angle +=
-        gyro_yaw_dps * dt;
+        gyro_yaw_dps *
+        dt;
 
 
     if (yaw_angle > 180.0f)
     {
-        yaw_angle -= 360.0f;
+        yaw_angle -=
+            360.0f;
     }
 
 
     if (yaw_angle < -180.0f)
     {
-        yaw_angle += 360.0f;
+        yaw_angle +=
+            360.0f;
     }
 }
 
@@ -1654,9 +1505,7 @@ int main(void)
 
 
     /* =====================================================
-       Board power / enable
-
-       PA1
+       Board enable PA1
        ===================================================== */
 
     gpio_high(
@@ -1670,8 +1519,7 @@ int main(void)
 
 
     /* =====================================================
-       Before PWM takes control:
-       motor pins LOW
+       Force motor pins LOW before TIM1
        ===================================================== */
 
     gpio_low(
@@ -1709,53 +1557,33 @@ int main(void)
 
 
     /* =====================================================
-       1 ms system timer
+       System time
        ===================================================== */
 
     systick_init();
 
 
-    delay_ms(100);
+    delay_ms(100U);
 
 
     /* =====================================================
-       Debug safety
-
-       Freeze TIM1 when debugger halts CPU.
-       ===================================================== */
-
-    RCC_APB2ENR |=
-        DBGMCU_EN;
-
-
-    DBGMCU_APB2_FZ |=
-        DBG_TIM1_STOP;
-
-
-    /* =====================================================
-       Motor PWM
+       Motor hardware PWM
        ===================================================== */
 
     tim1_pwm_init();
-
-
-    /*
-       IMPORTANT:
-       motors remain OFF
-    */
 
     motor_all_off();
 
 
     /* =====================================================
-       Software I2C
+       I2C
        ===================================================== */
 
     i2c_init();
 
 
     /* =====================================================
-       Initialize M540
+       M540
        ===================================================== */
 
     imu_ok =
@@ -1764,12 +1592,6 @@ int main(void)
 
     if (!imu_ok)
     {
-        /*
-           IMU failed.
-
-           Motors remain permanently OFF.
-        */
-
         calibration_status = 3U;
 
 
@@ -1781,9 +1603,9 @@ int main(void)
 
 
     /* =====================================================
-       GYRO CALIBRATION
+       Gyro calibration
 
-       DO NOT MOVE THE DRONE HERE.
+       DO NOT MOVE THE BOARD
        ===================================================== */
 
     if (!gyro_calibrate())
@@ -1796,15 +1618,30 @@ int main(void)
 
 
     /* =====================================================
-       Flight loop timing
+       Reset runtime diagnostics
        ===================================================== */
+
+    imu_frame_counter = 0U;
+
+    imu_error_counter = 0U;
+
+    imu_consecutive_errors = 0U;
+
+    flight_loop_counter = 0U;
+
+    loop_dt_max_ms = 0U;
+
+    imu_read_time_max_ms = 0U;
+
+    attitude_initialized = 0U;
+
 
     uint32_t last_loop_ms =
         system_ms;
 
 
     /* =====================================================
-       MAIN FLIGHT CONTROLLER LOOP
+       FLIGHT CONTROLLER LOOP
        ===================================================== */
 
     while (1)
@@ -1815,17 +1652,28 @@ int main(void)
 
         uint32_t elapsed =
             (uint32_t)(
-                now - last_loop_ms);
+                now -
+                last_loop_ms);
 
 
         /*
-           Run attitude loop approximately 100 Hz.
+           Target:
+               every 5 ms
+               = 200 Hz
         */
 
-        if (elapsed >= 10U)
+        if (elapsed >= LOOP_PERIOD_MS)
         {
             last_loop_ms =
                 now;
+
+
+            /* =============================================
+               Actual dt
+               ============================================= */
+
+            loop_dt_ms =
+                elapsed;
 
 
             loop_dt =
@@ -1833,22 +1681,63 @@ int main(void)
                 0.001f;
 
 
+            if (elapsed > 0U)
+            {
+                loop_hz =
+                    1000.0f /
+                    (float)elapsed;
+            }
+
+
+            if (elapsed >
+                loop_dt_max_ms)
+            {
+                loop_dt_max_ms =
+                    elapsed;
+            }
+
+
             /* =============================================
-               Read IMU
+               IMU read timing
                ============================================= */
+
+            uint32_t read_start =
+                system_ms;
+
 
             imu_read_ok =
                 m540_read_raw();
 
 
+            uint32_t read_end =
+                system_ms;
+
+
+            imu_read_time_ms =
+                (uint32_t)(
+                    read_end -
+                    read_start);
+
+
+            if (imu_read_time_ms >
+                imu_read_time_max_ms)
+            {
+                imu_read_time_max_ms =
+                    imu_read_time_ms;
+            }
+
+
+            /* =============================================
+               Successful frame
+               ============================================= */
+
             if (imu_read_ok)
             {
                 imu_frame_counter++;
 
+                imu_consecutive_errors =
+                    0U;
 
-                /* =========================================
-                   Calculate attitude
-                   ========================================= */
 
                 attitude_update(
                     loop_dt);
@@ -1859,9 +1748,25 @@ int main(void)
 
 
             /* =============================================
-               SAFETY
+               I2C error
+               ============================================= */
 
-               NO MOTOR MOVEMENT IN THIS FIRMWARE.
+            else
+            {
+                imu_error_counter++;
+
+                imu_consecutive_errors++;
+
+
+                /*
+                   If communication ever becomes unstable,
+                   motors remain OFF.
+                */
+            }
+
+
+            /* =============================================
+               ABSOLUTE MOTOR SAFETY
                ============================================= */
 
             motor_all_off();
