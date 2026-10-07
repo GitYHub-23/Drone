@@ -329,3 +329,110 @@ This completes the initial IMU bring-up stage.
 It was time consuming to identify the right channels, as I spent about 3 week for this, and with no result.
 I used ESP32-S3, connected to the MOSI, MISO, CLK, CSN, used bit pirate web flasher, and still no progress.
 So I ordered new 2xNRF24L01+ and I will use components of old controller to make a new one.
+
+## 2026-10-07 — 3-Axis Mixer Validation
+
+The rate controller and motor mixer were tested in dry-run mode before
+allowing the firmware to drive the physical motors.
+
+### Roll
+
+The initial mixer direction was found to be incorrect during testing.
+The Roll mixer signs were corrected and retested.
+
+Result: PASS.
+
+### Pitch
+
+The initial Pitch correction direction was also found to be reversed.
+The mixer was corrected based on the measured gyro response.
+
+Result: PASS.
+
+### Yaw
+
+A dedicated diagnostic recorder captured the peak yaw rate and motor
+commands during a manual right-yaw rotation.
+
+Measured peak:
+
+- Gyro Yaw: approximately -504 deg/s
+- PID Yaw output: +35
+
+Motor response:
+
+- M1 (CW): increased
+- M2 (CCW): decreased
+- M3 (CW): increased
+- M4 (CCW): decreased
+
+This produces a reaction torque opposing the manually applied rotation.
+
+Result: PASS.
+
+All physical motor outputs remained locked at 0% during these tests.
+
+### Conclusion
+
+Roll, Pitch and Yaw correction directions are now verified.
+
+The next milestone is the first propeller-free closed-loop test using the
+real motor outputs.
+
+## Current Development Status
+
+The custom flight controller firmware is now capable of reading the IMU,
+running a 200 Hz rate-control loop, calculating PID corrections and mixing
+them into four virtual motor outputs.
+
+### Completed
+
+- [x] Identified MCU: STM32F031K4
+- [x] Identified M540 IMU communication interface
+- [x] Confirmed M540 I2C address: `0x69`
+- [x] Confirmed `WHO_AM_I = 0x7D`
+- [x] Migrated IMU communication from software I2C to hardware I2C1
+- [x] Stable 100 kHz hardware I2C communication
+- [x] Stable 200 Hz flight-control loop
+- [x] Gyroscope calibration
+- [x] Identified IMU axes:
+  - X = Roll
+  - Y = Pitch
+  - Z = Yaw
+- [x] Identified all four motor outputs
+- [x] Confirmed physical motor positions and rotation directions
+- [x] Verified TIM1 PWM control of all four motors
+- [x] Implemented rate controller
+- [x] Implemented X-quad motor mixer
+- [x] Verified Roll correction direction in dry-run testing
+- [x] Verified Pitch correction direction in dry-run testing
+- [x] Verified Yaw correction direction in dry-run testing
+- [x] Added motor output limits and IMU failure shutdown
+
+### Motor Layout
+
+                 FRONT
+                   ↑
+
+            M2 CCW     M1 CW
+         Front-Left   Front-Right
+
+            M3 CW      M4 CCW
+          Rear-Left   Rear-Right
+
+STM32 motor mapping:
+
+| Motor | Position | Direction | STM32 |
+|------|----------|-----------|-------|
+| M1 | Front Right | CW | PA11 / TIM1_CH4 |
+| M2 | Front Left | CCW | PA9 / TIM1_CH2 |
+| M3 | Rear Left | CW | PA8 / TIM1_CH1 |
+| M4 | Rear Right | CCW | PA10 / TIM1_CH3 |
+
+### Verified Mixer
+
+```c
+M1 = throttle + roll + pitch + yaw;
+M2 = throttle - roll + pitch - yaw;
+M3 = throttle - roll - pitch + yaw;
+M4 = throttle + roll - pitch - yaw;
