@@ -431,8 +431,14 @@ STM32 motor mapping:
 
 ### Verified Mixer
 
-```c
 M1 = throttle + roll + pitch + yaw;
 M2 = throttle - roll + pitch - yaw;
 M3 = throttle - roll - pitch + yaw;
 M4 = throttle + roll - pitch - yaw;
+
+
+## 8 November 2026
+
+I finally got the second nRF24L01+, so today I mainly worked on it. Like transferring datas between the old controller and the drone. 
+I hope I can finish it in next week, if my school doesn't disturb me. 
+Today, I was just repeating past works to ensure that new nRF24L01+ work great. Then I will do the safety systems and finally motors and first flight!
