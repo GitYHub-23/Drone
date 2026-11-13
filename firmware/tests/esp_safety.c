@@ -1,187 +1,162 @@
 
 /*
- * =========================================
- * DRONE_ STEP 18
- * ESP32-S3-N16R8 + NRF24L01+ HW-725
+ * ============================================
+ * DRONE_ STEP 18.1
+ * ESP32-S3-N16R8 + nRF24L01+ (HW-725)
  *
- * JOYSTICK POWER PROTECTION
+ * TRANSMITTER POWER FAILSAFE
+ * ============================================
  *
- * Features:
- * - Detect switched joystick power
- * - Stop TX if joystick power is lost
- * - Wait for stable power on recovery
- * - Calibrate joystick centers
- * - Require minimum throttle
- * - Require neutral Roll/Pitch/Yaw
- * - Recalibrate after power interruption
- * - Transmit original 9-byte protocol
+ * Corrections:
+ * 1. Throttle minimum is always HIGH ADC.
+ * 2. Full joystick travel is permitted.
+ * 3. Detect power loss and voltage sag.
+ * 4. Recalibrate after interruption.
+ * 5. Require safe stick positions.
  *
- * BENCH DIAGNOSTICS ONLY
+ * Diagnostic firmware ONLY.
  *
- * STM32 MOTOR LOCK MUST STAY ENABLED.
- * MOTORS PHYSICALLY DISCONNECTED.
- * PROPELLERS REMOVED.
- *
- * No arming or real motor operation.
- * =========================================
+ * STM32 must remain DISARMED.
+ * Motors must remain disconnected.
+ * Propellers must remain removed.
  */
 
 #include <Arduino.h>
 #include <SPI.h>
 #include <RF24.h>
 
-/* =========================================
- * NRF24 PIN MAPPING
- * ========================================= */
+// ============================================
+// PINS
+// ============================================
 
-#define NRF_CE   9
-#define NRF_CSN  10
-#define NRF_SCK  12
-#define NRF_MOSI 11
-#define NRF_MISO 13
+#define NRF_CE    9
+#define NRF_CSN   10
+#define NRF_SCK   12
+#define NRF_MOSI  11
+#define NRF_MISO  13
 
-/* =========================================
- * JOYSTICK PIN MAPPING
- * ========================================= */
+#define PIN_THROTTLE  1
+#define PIN_YAW       2
+#define PIN_ROLL      3
+#define PIN_PITCH     4
 
-#define PIN_THROTTLE 1
-#define PIN_YAW      2
-#define PIN_ROLL     3
-#define PIN_PITCH    4
+// 10k + 10k voltage divider
+#define PIN_POWER     14
 
-/* =========================================
- * SWITCHED POWER SENSOR
- * ========================================= */
+// ============================================
+// POWER CONFIGURATION
+// ============================================
 
-/*
- * GPIO14 receives the MIDPOINT
- * of a 10k / 10k resistor divider.
- *
- * Switched supply -> 10k -> GPIO14
- *                         |
- *                        10k
- *                         |
- *                        GND
- *
- * Supply must be 0-5V only.
- */
+// Your normal measured voltage:
+// approximately 1640-1645 mV.
+//
+// OFF:
+// approximately 0 mV.
 
-#define PIN_POWER_SENSE 14
+const uint32_t POWER_START_MV = 1560;
+const uint32_t POWER_DROP_ALLOW_MV = 85;
+const uint32_t POWER_RISE_ALLOW_MV = 100;
 
-/*
- * Divider outputs approximately:
- *
- * Supply OFF : 0 mV
- * Supply 3.3V: 1650 mV
- * Supply 5V  : 2500 mV
- */
+const uint32_t POWER_STABLE_SPREAD_MV = 50;
 
-const uint32_t POWER_ON_THRESHOLD_MV = 900;
+const uint32_t POWER_STABLE_TIME_MS = 1500;
 
-/* =========================================
- * TIMING
- * ========================================= */
+// ============================================
+// JOYSTICK CALIBRATION
+// ============================================
 
-const uint32_t POWER_STABLE_MS = 1000;
-const uint32_t SAFE_STICKS_MS = 1000;
+// According to your verified measurements:
+//
+// Throttle DOWN = ADC ~4095
+// Throttle UP   = ADC ~0
 
+const uint16_t THROTTLE_CAL_MIN = 3900;
+const uint16_t THROTTLE_DEADBAND = 125;
+
+const uint16_t CENTER_MIN = 1500;
+const uint16_t CENTER_MAX = 2500;
+
+const uint16_t CENTER_TOLERANCE = 160;
+
+const uint16_t MAX_CAL_SPREAD = 180;
+const uint16_t MAX_THROTTLE_SPREAD = 180;
+
+// ============================================
+// TIMING
+// ============================================
+
+const uint32_t SAFE_STICKS_TIME_MS = 1000;
 const uint32_t TX_INTERVAL_MS = 50;
 const uint32_t PRINT_INTERVAL_MS = 1000;
 
-/* =========================================
- * CALIBRATION SETTINGS
- * ========================================= */
-
-const uint16_t CENTER_MIN_ADC = 1300;
-const uint16_t CENTER_MAX_ADC = 2800;
-
-const uint16_t CENTER_TOLERANCE_ADC = 160;
-const uint16_t THROTTLE_TOLERANCE_ADC = 150;
-
-const uint16_t THROTTLE_LOW_LIMIT = 700;
-const uint16_t THROTTLE_HIGH_LIMIT = 3395;
-
-const uint16_t MAX_CALIBRATION_SPREAD = 180;
-
-/* =========================================
- * RADIO CONFIGURATION
- * ========================================= */
+// ============================================
+// RADIO
+// ============================================
 
 RF24 radio(NRF_CE, NRF_CSN);
 
-const uint8_t RADIO_ADDRESS[5] = {
+const uint8_t radioAddress[5] = {
   0xCC, 0xCC, 0xCC, 0xCC, 0xCC
 };
 
-/* =========================================
- * AXIS SETTINGS
- * ========================================= */
-
-/*
- * These are the settings used for
- * the previous transmitter diagnostics.
- *
- * Axis directions remain subject to
- * final physical verification.
- */
+// Keep the same directions as Step 18.
 
 const bool INVERT_YAW = false;
 const bool INVERT_ROLL = false;
 const bool INVERT_PITCH = false;
 
-/* =========================================
- * SYSTEM STATES
- * ========================================= */
+// ============================================
+// TRANSMITTER STATES
+// ============================================
 
-enum SystemState {
+enum TxState {
   WAIT_POWER,
-  WAIT_POWER_STABLE,
+  WAIT_STABLE_POWER,
   CALIBRATING,
   WAIT_SAFE_STICKS,
   TX_ACTIVE
 };
 
-SystemState state = WAIT_POWER;
+TxState state = WAIT_POWER;
 
-/* =========================================
- * VARIABLES
- * ========================================= */
+// ============================================
+// VARIABLES
+// ============================================
 
 uint16_t centerYaw = 2048;
 uint16_t centerRoll = 2048;
 uint16_t centerPitch = 2048;
 
-uint16_t throttleMinimumRaw = 0;
-bool throttleMinAtLowADC = true;
+uint16_t throttleMinRaw = 4095;
 
-uint32_t powerStableStartMs = 0;
-uint32_t safeSticksStartMs = 0;
+uint32_t powerBaselineMv = 0;
+uint32_t minimumPowerMv = POWER_START_MV;
+
+uint32_t stableStartMs = 0;
+uint32_t stableMinMv = 0;
+uint32_t stableMaxMv = 0;
+
+uint32_t safeStartMs = 0;
 
 uint32_t lastTxMs = 0;
 uint32_t lastPrintMs = 0;
 
 uint32_t txCount = 0;
-uint32_t powerLossCount = 0;
+uint32_t powerFaultCount = 0;
 
-bool calibrationOK = false;
+uint8_t sequenceNumber = 0;
 
-/* Original 9-byte packet */
+bool calibrationValid = false;
 
+// Original receiver-compatible packet.
 uint8_t packet[9] = {
-  0xE1,
-  0x8D,
-  0x70,
-  0x70,
-  0x05,
-  0x38,
-  0x00,
-  0x00,
-  0x00
+  225, 141, 112, 112,
+  5, 56, 0, 0, 0
 };
 
-/* =========================================
- * ADC HELPERS
- * ========================================= */
+// ============================================
+// ADC FUNCTIONS
+// ============================================
 
 uint16_t readADC(uint8_t pin)
 {
@@ -194,41 +169,42 @@ uint16_t readADC(uint8_t pin)
   return (uint16_t)(sum / 4);
 }
 
-/* =========================================
- * POWER MONITOR
- * ========================================= */
-
-uint32_t powerSenseMilliVolts()
+uint32_t readPowerMv()
 {
   uint32_t sum = 0;
 
   for (int i = 0; i < 4; i++) {
-    sum += analogReadMilliVolts(
-      PIN_POWER_SENSE
-    );
+    sum += analogReadMilliVolts(PIN_POWER);
   }
 
   return sum / 4;
 }
 
-bool joystickPowerOK()
+void readAllSticks(
+  uint16_t &t,
+  uint16_t &y,
+  uint16_t &r,
+  uint16_t &p
+)
 {
-  return powerSenseMilliVolts() >=
-         POWER_ON_THRESHOLD_MV;
+  t = readADC(PIN_THROTTLE);
+  y = readADC(PIN_YAW);
+  r = readADC(PIN_ROLL);
+  p = readADC(PIN_PITCH);
 }
 
-/* =========================================
- * STATE NAME
- * ========================================= */
+// ============================================
+// STATE NAMES
+// ============================================
 
-const char *stateName(SystemState value)
+const char *stateName(TxState s)
 {
-  switch (value) {
+  switch (s) {
     case WAIT_POWER:
       return "WAIT_POWER";
 
-    case WAIT_POWER_STABLE:
-      return "WAIT_POWER_STABLE";
+    case WAIT_STABLE_POWER:
+      return "WAIT_STABLE_POWER";
 
     case CALIBRATING:
       return "CALIBRATING";
@@ -244,88 +220,39 @@ const char *stateName(SystemState value)
   }
 }
 
-/* =========================================
- * STOP VALID RADIO TRANSMISSION
- * ========================================= */
+// ============================================
+// POWER STABILITY
+// ============================================
 
-void stopTransmission()
-{
-  if (state != WAIT_POWER) {
-    powerLossCount++;
-
-    Serial.println();
-    Serial.println(
-      "!!! JOYSTICK POWER LOST !!!"
-    );
-
-    Serial.println(
-      "CONTROL PACKETS STOPPED"
-    );
-  }
-
-  state = WAIT_POWER;
-  calibrationOK = false;
-
-  safeSticksStartMs = 0;
-  powerStableStartMs = 0;
-
-  /*
-   * There is intentionally NO
-   * radio.write() in this state.
-   *
-   * STM32 should detect a timeout.
-   */
-}
-
-/* =========================================
- * THROTTLE CHECK
- * ========================================= */
-
-bool throttleAtMinimum(uint16_t raw)
-{
-  if (throttleMinAtLowADC) {
-
-    return
-      (uint32_t)raw <=
-      (uint32_t)throttleMinimumRaw +
-      THROTTLE_TOLERANCE_ADC;
-
-  } else {
-
-    return
-      (uint32_t)raw +
-      THROTTLE_TOLERANCE_ADC >=
-      (uint32_t)throttleMinimumRaw;
-  }
-}
-
-/* =========================================
- * CENTER CHECK
- * ========================================= */
-
-bool sticksCentered(
-  uint16_t yaw,
-  uint16_t roll,
-  uint16_t pitch
+void beginPowerStabilization(
+  uint32_t now,
+  uint32_t mv
 )
 {
-  if (
-    abs((int)yaw - (int)centerYaw) >
-      CENTER_TOLERANCE_ADC
-  ) {
+  stableStartMs = now;
+  stableMinMv = mv;
+  stableMaxMv = mv;
+
+  state = WAIT_STABLE_POWER;
+}
+
+bool runtimePowerOK(uint32_t mv)
+{
+  if (!calibrationValid) {
+    return false;
+  }
+
+  if (mv < POWER_START_MV) {
+    return false;
+  }
+
+  if (mv < minimumPowerMv) {
     return false;
   }
 
   if (
-    abs((int)roll - (int)centerRoll) >
-      CENTER_TOLERANCE_ADC
-  ) {
-    return false;
-  }
-
-  if (
-    abs((int)pitch - (int)centerPitch) >
-      CENTER_TOLERANCE_ADC
+    mv >
+    powerBaselineMv + POWER_RISE_ALLOW_MV
   ) {
     return false;
   }
@@ -333,86 +260,207 @@ bool sticksCentered(
   return true;
 }
 
-/* =========================================
- * CALIBRATION
- * ========================================= */
+// ============================================
+// TRANSMISSION STOP
+// ============================================
 
-bool calibrateJoysticks()
+void stopTransmission(
+  const char *reason,
+  uint32_t measuredMv
+)
 {
-  const uint8_t pins[3] = {
-    PIN_YAW,
-    PIN_ROLL,
-    PIN_PITCH
-  };
+  if (state == TX_ACTIVE) {
+    powerFaultCount++;
+  }
 
-  uint32_t sums[3] = {0, 0, 0};
+  if (state != WAIT_POWER) {
+    Serial.println();
+    Serial.println(
+      "!!! TRANSMISSION STOPPED !!!"
+    );
 
-  uint16_t low[3] = {
-    4095, 4095, 4095
-  };
+    Serial.print("REASON: ");
+    Serial.println(reason);
 
-  uint16_t high[3] = {0, 0, 0};
+    Serial.printf(
+      "POWER=%lu mV\n",
+      (unsigned long)measuredMv
+    );
+  }
 
-  uint32_t throttleSum = 0;
+  calibrationValid = false;
 
-  const int samples = 80;
+  powerBaselineMv = 0;
+  minimumPowerMv = POWER_START_MV;
 
+  safeStartMs = 0;
+  stableStartMs = 0;
+
+  state = WAIT_POWER;
+
+  /*
+   * IMPORTANT:
+   *
+   * No radio.write() here.
+   * The STM32 receiver must detect
+   * missing packets and remain locked.
+   */
+}
+
+// ============================================
+// THROTTLE SAFETY
+// ============================================
+
+bool throttleAtMinimum(uint16_t raw)
+{
+  // The minimum is ALWAYS at high ADC.
+  if (raw < THROTTLE_CAL_MIN) {
+    return false;
+  }
+
+  return (
+    (uint32_t)raw +
+    THROTTLE_DEADBAND >=
+    (uint32_t)throttleMinRaw
+  );
+}
+
+// ============================================
+// CENTERED STICKS
+// ============================================
+
+bool sticksCentered(
+  uint16_t y,
+  uint16_t r,
+  uint16_t p
+)
+{
+  return (
+    abs((int)y - (int)centerYaw)
+      <= CENTER_TOLERANCE &&
+
+    abs((int)r - (int)centerRoll)
+      <= CENTER_TOLERANCE &&
+
+    abs((int)p - (int)centerPitch)
+      <= CENTER_TOLERANCE
+  );
+}
+
+// ============================================
+// CALIBRATION
+// ============================================
+
+bool calibrateSticks()
+{
   Serial.println();
   Serial.println("CALIBRATION START");
-  Serial.println(
-    "Keep throttle DOWN"
-  );
-  Serial.println(
-    "Keep other sticks CENTERED"
-  );
+  Serial.println("Throttle FULL DOWN");
+  Serial.println("Yaw/Roll/Pitch CENTER");
 
-  for (int i = 0; i < samples; i++) {
+  const int SAMPLES = 80;
 
-    if (!joystickPowerOK()) {
+  uint32_t sums[4] = {0, 0, 0, 0};
+
+  uint16_t minADC[4] = {
+    4095, 4095, 4095, 4095
+  };
+
+  uint16_t maxADC[4] = {
+    0, 0, 0, 0
+  };
+
+  uint32_t powerSum = 0;
+  uint32_t powerMin = 10000;
+  uint32_t powerMax = 0;
+
+  for (int i = 0; i < SAMPLES; i++) {
+
+    uint32_t mv = readPowerMv();
+
+    if (mv < POWER_START_MV) {
       Serial.println(
-        "CAL ABORT: POWER LOST"
+        "CAL ERROR: LOW POWER"
       );
       return false;
     }
 
-    throttleSum +=
-      analogRead(PIN_THROTTLE);
+    powerSum += mv;
 
-    for (int a = 0; a < 3; a++) {
+    if (mv < powerMin) {
+      powerMin = mv;
+    }
 
-      uint16_t v = analogRead(pins[a]);
+    if (mv > powerMax) {
+      powerMax = mv;
+    }
 
-      sums[a] += v;
+    uint16_t values[4];
 
-      if (v < low[a]) {
-        low[a] = v;
+    readAllSticks(
+      values[0],
+      values[1],
+      values[2],
+      values[3]
+    );
+
+    for (int a = 0; a < 4; a++) {
+
+      sums[a] += values[a];
+
+      if (values[a] < minADC[a]) {
+        minADC[a] = values[a];
       }
 
-      if (v > high[a]) {
-        high[a] = v;
+      if (values[a] > maxADC[a]) {
+        maxADC[a] = values[a];
       }
     }
 
     delay(5);
   }
 
-  if (!joystickPowerOK()) {
+  if (
+    (powerMax - powerMin) >
+    POWER_STABLE_SPREAD_MV
+  ) {
+    Serial.println(
+      "CAL ERROR: UNSTABLE POWER"
+    );
     return false;
   }
 
-  uint16_t throttleRaw =
-    (uint16_t)(throttleSum / samples);
+  uint16_t t = sums[0] / SAMPLES;
+  uint16_t y = sums[1] / SAMPLES;
+  uint16_t r = sums[2] / SAMPLES;
+  uint16_t p = sums[3] / SAMPLES;
 
-  uint16_t centers[3];
+  // Never automatically reverse throttle.
+
+  if (t < THROTTLE_CAL_MIN) {
+    Serial.printf(
+      "CAL ERROR: THROTTLE=%u\n", t
+    );
+    return false;
+  }
+
+  if (
+    (maxADC[0] - minADC[0]) >
+    MAX_THROTTLE_SPREAD
+  ) {
+    Serial.println(
+      "CAL ERROR: THROTTLE MOVING"
+    );
+    return false;
+  }
+
+  const uint16_t centers[3] = {y, r, p};
 
   for (int a = 0; a < 3; a++) {
 
-    centers[a] =
-      (uint16_t)(sums[a] / samples);
-
     if (
-      centers[a] < CENTER_MIN_ADC ||
-      centers[a] > CENTER_MAX_ADC
+      centers[a] < CENTER_MIN ||
+      centers[a] > CENTER_MAX
     ) {
       Serial.println(
         "CAL ERROR: INVALID CENTER"
@@ -421,8 +469,8 @@ bool calibrateJoysticks()
     }
 
     if (
-      (high[a] - low[a]) >
-      MAX_CALIBRATION_SPREAD
+      (maxADC[a + 1] - minADC[a + 1]) >
+      MAX_CAL_SPREAD
     ) {
       Serial.println(
         "CAL ERROR: STICK MOVING"
@@ -431,52 +479,81 @@ bool calibrateJoysticks()
     }
   }
 
-  if (throttleRaw <= THROTTLE_LOW_LIMIT) {
+  uint32_t finalPower = readPowerMv();
 
-    throttleMinAtLowADC = true;
-
-  } else if (
-    throttleRaw >= THROTTLE_HIGH_LIMIT
-  ) {
-
-    throttleMinAtLowADC = false;
-
-  } else {
-
+  if (finalPower < POWER_START_MV) {
     Serial.println(
-      "CAL ERROR: THROTTLE NOT MINIMUM"
+      "CAL ERROR: POWER LOST"
     );
-
     return false;
   }
 
-  centerYaw = centers[0];
-  centerRoll = centers[1];
-  centerPitch = centers[2];
+  throttleMinRaw = t;
 
-  throttleMinimumRaw = throttleRaw;
+  centerYaw = y;
+  centerRoll = r;
+  centerPitch = p;
 
-  calibrationOK = true;
+  powerBaselineMv = powerSum / SAMPLES;
+
+  if (
+    powerBaselineMv >
+    POWER_DROP_ALLOW_MV
+  ) {
+    minimumPowerMv =
+      powerBaselineMv -
+      POWER_DROP_ALLOW_MV;
+  } else {
+    minimumPowerMv = POWER_START_MV;
+  }
+
+  if (minimumPowerMv < POWER_START_MV) {
+    minimumPowerMv = POWER_START_MV;
+  }
+
+  if (!runtimePowerOK(finalPower)) {
+    // calibrationValid is still false here;
+    // check the voltage directly instead.
+
+    if (
+      finalPower < minimumPowerMv ||
+      finalPower >
+        powerBaselineMv + POWER_RISE_ALLOW_MV
+    ) {
+      Serial.println(
+        "CAL ERROR: POWER CHANGED"
+      );
+      return false;
+    }
+  }
+
+  calibrationValid = true;
 
   Serial.printf(
     "CAL OK T=%u Y=%u R=%u P=%u\n",
-    throttleMinimumRaw,
-    centerYaw,
-    centerRoll,
-    centerPitch
+    t, y, r, p
   );
 
   Serial.printf(
-    "THROTTLE MIN ADC: %s\n",
-    throttleMinAtLowADC ? "LOW" : "HIGH"
+    "POWER BASELINE=%lu mV\n",
+    (unsigned long)powerBaselineMv
+  );
+
+  Serial.printf(
+    "POWER MINIMUM=%lu mV\n",
+    (unsigned long)minimumPowerMv
+  );
+
+  Serial.println(
+    "THROTTLE MIN: HIGH ADC"
   );
 
   return true;
 }
 
-/* =========================================
- * AXIS ENCODING
- * ========================================= */
+// ============================================
+// AXIS ENCODING
+// ============================================
 
 uint8_t encodeAxis(
   uint16_t raw,
@@ -489,7 +566,6 @@ uint8_t encodeAxis(
   int middle = center;
 
   if (invert) {
-
     value = 4095 - value;
     middle = 4095 - middle;
   }
@@ -518,106 +594,50 @@ uint8_t encodeAxis(
   }
 
   return (uint8_t)constrain(
-    result,
-    0,
-    225
+    result, 0, 225
   );
 }
 
-/* =========================================
- * THROTTLE ENCODING
- * ========================================= */
+// ============================================
+// THROTTLE ENCODING
+// ============================================
 
 uint8_t encodeThrottle(uint16_t raw)
 {
-  raw = constrain(raw, 0, 4095);
+  // Original radio protocol:
+  //
+  // 225 = 0% gas
+  //   0 = 100% gas
 
   if (throttleAtMinimum(raw)) {
     return 225;
   }
 
-  uint32_t scaled =
-    ((uint32_t)raw * 225U + 2047U) /
-    4095U;
+  uint32_t result =
+    ((uint32_t)raw * 225U + 2047U)
+    / 4095U;
 
-  if (throttleMinAtLowADC) {
-    return (uint8_t)(225U - scaled);
-  }
-
-  return (uint8_t)scaled;
+  return (uint8_t)result;
 }
 
-/* =========================================
- * THROTTLE PERCENT
- * ========================================= */
+// ============================================
+// CHECKSUM
+// ============================================
 
-uint32_t throttlePercent(uint8_t value)
+uint8_t calculateChecksum()
 {
-  return
-    ((225U - value) * 100U + 112U) /
-    225U;
-}
-
-/* =========================================
- * PACKET CHECKSUM
- * ========================================= */
-
-uint8_t packetChecksum(
-  const uint8_t *data
-)
-{
-  uint16_t sum = 0x76U;
+  uint16_t sum = 0x76;
 
   for (int i = 0; i < 8; i++) {
-    sum += data[i];
+    sum += packet[i];
   }
 
   return (uint8_t)(sum & 0xFF);
 }
 
-/* =========================================
- * INPUT VALIDATION
- * ========================================= */
-
-bool readValidInputs(
-  uint16_t &t,
-  uint16_t &y,
-  uint16_t &r,
-  uint16_t &p
-)
-{
-  if (!joystickPowerOK()) {
-    return false;
-  }
-
-  t = readADC(PIN_THROTTLE);
-  y = readADC(PIN_YAW);
-  r = readADC(PIN_ROLL);
-  p = readADC(PIN_PITCH);
-
-  if (!joystickPowerOK()) {
-    return false;
-  }
-
-  /*
-   * Additional diagnostic guard:
-   * all three axes near zero together
-   * are treated as invalid.
-   *
-   * This is not a substitute for
-   * power sensing.
-   */
-
-  if (y < 60 && r < 60 && p < 60) {
-    return false;
-  }
-
-  return true;
-}
-
-/* =========================================
- * RADIO INITIALIZATION
- * ========================================= */
+// ============================================
+// RADIO CONFIGURATION
+// ============================================
 
 bool initializeRadio()
 {
@@ -635,58 +655,67 @@ bool initializeRadio()
   radio.setAddressWidth(5);
 
   radio.setChannel(45);
-
   radio.setDataRate(RF24_1MBPS);
-
   radio.setPALevel(RF24_PA_LOW);
 
   radio.setAutoAck(false);
   radio.setRetries(0, 0);
 
   radio.disableDynamicPayloads();
-
-  radio.setCRCLength(RF24_CRC_16);
   radio.setPayloadSize(9);
+  radio.setCRCLength(RF24_CRC_16);
 
-  radio.openWritingPipe(RADIO_ADDRESS);
+  radio.openWritingPipe(radioAddress);
+
   radio.stopListening();
 
   return true;
 }
 
-/* =========================================
- * SETUP
- * ========================================= */
+// ============================================
+// SETUP
+// ============================================
 
 void setup()
 {
   Serial.begin(115200);
   delay(1000);
 
-  Serial.println();
-  Serial.println("==========================");
-  Serial.println("DRONE_ STEP 18");
-  Serial.println("JOYSTICK POWER PROTECTION");
-  Serial.println("==========================");
-
   analogReadResolution(12);
 
   analogSetPinAttenuation(
-    PIN_POWER_SENSE,
-    ADC_11db
+    PIN_POWER, ADC_11db
   );
 
+  analogSetPinAttenuation(
+    PIN_THROTTLE, ADC_11db
+  );
+
+  analogSetPinAttenuation(
+    PIN_YAW, ADC_11db
+  );
+
+  analogSetPinAttenuation(
+    PIN_ROLL, ADC_11db
+  );
+
+  analogSetPinAttenuation(
+    PIN_PITCH, ADC_11db
+  );
+
+  pinMode(PIN_POWER, INPUT);
   pinMode(PIN_THROTTLE, INPUT);
   pinMode(PIN_YAW, INPUT);
   pinMode(PIN_ROLL, INPUT);
   pinMode(PIN_PITCH, INPUT);
 
-  pinMode(PIN_POWER_SENSE, INPUT);
-
-  Serial.println("Initializing NRF24...");
+  Serial.println();
+  Serial.println("=========================");
+  Serial.println("DRONE_ STEP 18.1");
+  Serial.println("POWER FAILSAFE UPDATED");
+  Serial.println("=========================");
 
   if (!initializeRadio()) {
-
     Serial.println(
       "ERROR: NRF24 NOT FOUND"
     );
@@ -697,45 +726,57 @@ void setup()
   }
 
   Serial.println("NRF24 OK");
-  Serial.println("Channel: 45");
-  Serial.println("Payload: 9 bytes");
+  Serial.println("CHANNEL: 45");
+  Serial.println("PAYLOAD: 9 BYTES");
+  Serial.println("THROTTLE MIN ADC: HIGH");
 
   Serial.println();
-  Serial.println(
-    "Waiting for switched joystick power"
-  );
+  Serial.println("WAITING FOR POWER");
 
   state = WAIT_POWER;
 }
 
-/* =========================================
- * MAIN LOOP
- * ========================================= */
+// ============================================
+// MAIN LOOP
+// ============================================
 
 void loop()
 {
   uint32_t now = millis();
+  uint32_t powerMv = readPowerMv();
 
-  uint32_t senseMv =
-    powerSenseMilliVolts();
+  // ----------------------------------------
+  // STATE 1: WAIT FOR POWER
+  // ----------------------------------------
 
-  /* =====================================
-   * HIGHEST PRIORITY: POWER VALIDATION
-   * ===================================== */
+  if (state == WAIT_POWER) {
 
-  if (senseMv < POWER_ON_THRESHOLD_MV) {
+    if (powerMv >= POWER_START_MV) {
 
-    stopTransmission();
+      Serial.println();
+      Serial.println(
+        "JOYSTICK POWER DETECTED"
+      );
 
-    if (
-      (uint32_t)(now - lastPrintMs) >=
+      Serial.printf(
+        "POWER=%lu mV\n",
+        (unsigned long)powerMv
+      );
+
+      beginPowerStabilization(
+        now, powerMv
+      );
+
+    } else if (
+      now - lastPrintMs >=
       PRINT_INTERVAL_MS
     ) {
+
       lastPrintMs = now;
 
       Serial.printf(
-        "STATE=WAIT_POWER SENSE=%lu mV\n",
-        (unsigned long)senseMv
+        "WAIT_POWER | %lu mV\n",
+        (unsigned long)powerMv
       );
     }
 
@@ -743,66 +784,85 @@ void loop()
     return;
   }
 
-  /* =====================================
-   * NEW POWER DETECTED
-   * ===================================== */
+  // ----------------------------------------
+  // STATE 2: STABILIZE POWER
+  // ----------------------------------------
 
-  if (state == WAIT_POWER) {
+  if (state == WAIT_STABLE_POWER) {
 
-    powerStableStartMs = now;
+    if (powerMv < POWER_START_MV) {
 
-    state = WAIT_POWER_STABLE;
+      stopTransmission(
+        "POWER BELOW START LIMIT",
+        powerMv
+      );
 
-    Serial.println();
-    Serial.println(
-      "JOYSTICK POWER DETECTED"
-    );
+      delay(5);
+      return;
+    }
 
-    Serial.printf(
-      "SENSE=%lu mV\n",
-      (unsigned long)senseMv
-    );
-  }
+    if (powerMv < stableMinMv) {
+      stableMinMv = powerMv;
+    }
 
-  /* =====================================
-   * WAIT FOR STABLE POWER
-   * ===================================== */
-
-  if (state == WAIT_POWER_STABLE) {
+    if (powerMv > stableMaxMv) {
+      stableMaxMv = powerMv;
+    }
 
     if (
-      (uint32_t)(
-        millis() - powerStableStartMs
-      ) < POWER_STABLE_MS
+      stableMaxMv - stableMinMv >
+      POWER_STABLE_SPREAD_MV
+    ) {
+
+      // Restart the stability interval.
+
+      stableStartMs = now;
+      stableMinMv = powerMv;
+      stableMaxMv = powerMv;
+    }
+
+    if (
+      now - stableStartMs <
+      POWER_STABLE_TIME_MS
     ) {
       delay(5);
       return;
     }
 
     state = CALIBRATING;
+
+    Serial.println(
+      "POWER STABLE"
+    );
   }
 
-  /* =====================================
-   * CALIBRATE AFTER POWER-ON
-   * ===================================== */
+  // ----------------------------------------
+  // STATE 3: CALIBRATION
+  // ----------------------------------------
 
   if (state == CALIBRATING) {
 
-    calibrationOK = false;
+    calibrationValid = false;
 
-    if (!calibrateJoysticks()) {
+    if (!calibrateSticks()) {
 
-      if (!joystickPowerOK()) {
+      uint32_t mv = readPowerMv();
 
-        stopTransmission();
+      if (mv < POWER_START_MV) {
+
+        stopTransmission(
+          "POWER LOST DURING CAL",
+          mv
+        );
 
       } else {
 
-        state = WAIT_POWER_STABLE;
-        powerStableStartMs = millis();
+        beginPowerStabilization(
+          millis(), mv
+        );
 
         Serial.println(
-          "Calibration retry required"
+          "CALIBRATION RETRY"
         );
       }
 
@@ -811,7 +871,7 @@ void loop()
     }
 
     state = WAIT_SAFE_STICKS;
-    safeSticksStartMs = 0;
+    safeStartMs = 0;
 
     Serial.println();
     Serial.println(
@@ -819,64 +879,76 @@ void loop()
     );
 
     Serial.println(
-      "Waiting for safe joystick positions"
+      "WAITING FOR SAFE STICKS"
     );
   }
 
-  /* =====================================
-   * REQUIRE SAFE STICK POSITIONS
-   * ===================================== */
+  // ----------------------------------------
+  // STATE 4: SAFE STICK CHECK
+  // ----------------------------------------
 
   if (state == WAIT_SAFE_STICKS) {
 
+    if (!runtimePowerOK(powerMv)) {
+
+      stopTransmission(
+        "POWER UNSTABLE",
+        powerMv
+      );
+
+      return;
+    }
+
     uint16_t t, y, r, p;
 
-    if (!readValidInputs(t, y, r, p)) {
+    readAllSticks(t, y, r, p);
 
-      if (!joystickPowerOK()) {
-        stopTransmission();
-      } else {
-        safeSticksStartMs = 0;
-      }
+    uint32_t mv = readPowerMv();
+
+    if (!runtimePowerOK(mv)) {
+
+      stopTransmission(
+        "POWER CHANGED",
+        mv
+      );
 
       return;
     }
 
     bool safe =
-      calibrationOK &&
       throttleAtMinimum(t) &&
       sticksCentered(y, r, p);
 
     if (!safe) {
 
-      safeSticksStartMs = 0;
+      safeStartMs = 0;
 
       if (
-        (uint32_t)(now - lastPrintMs) >=
+        now - lastPrintMs >=
         PRINT_INTERVAL_MS
       ) {
+
         lastPrintMs = now;
 
         Serial.printf(
-          "WAIT_SAFE T=%u Y=%u R=%u P=%u\n",
+          "WAIT_SAFE | T=%u Y=%u R=%u P=%u\n",
           t, y, r, p
         );
       }
 
-      delay(10);
+      delay(5);
       return;
     }
 
-    if (safeSticksStartMs == 0) {
-      safeSticksStartMs = millis();
+    if (safeStartMs == 0) {
+      safeStartMs = now;
     }
 
     if (
-      (uint32_t)(
-        millis() - safeSticksStartMs
-      ) < SAFE_STICKS_MS
+      now - safeStartMs <
+      SAFE_STICKS_TIME_MS
     ) {
-      delay(10);
+      delay(5);
       return;
     }
 
@@ -885,14 +957,19 @@ void loop()
     lastTxMs = millis();
 
     Serial.println();
-    Serial.println("SAFE INPUTS CONFIRMED");
+    Serial.println(
+      "SAFE STICKS CONFIRMED"
+    );
+
     Serial.println("TX ACTIVE");
-    Serial.println("MOTORS MUST STAY OFF");
+    Serial.println(
+      "MOTORS MUST REMAIN OFF"
+    );
   }
 
-  /* =====================================
-   * ACTIVE RADIO TRANSMISSION
-   * ===================================== */
+  // ----------------------------------------
+  // STATE 5: TRANSMISSION
+  // ----------------------------------------
 
   if (state != TX_ACTIVE) {
     delay(2);
@@ -900,136 +977,137 @@ void loop()
   }
 
   now = millis();
+  powerMv = readPowerMv();
+
+  if (!runtimePowerOK(powerMv)) {
+
+    stopTransmission(
+      "POWER DROP OR INSTABILITY",
+      powerMv
+    );
+
+    return;
+  }
 
   if (
-    (uint32_t)(now - lastTxMs) <
+    now - lastTxMs <
     TX_INTERVAL_MS
   ) {
     delay(1);
     return;
   }
 
-  lastTxMs = now;
+  uint16_t rawT, rawY, rawR, rawP;
 
-  uint16_t rawT;
-  uint16_t rawY;
-  uint16_t rawR;
-  uint16_t rawP;
+  readAllSticks(
+    rawT, rawY, rawR, rawP
+  );
 
-  if (!readValidInputs(
-        rawT, rawY, rawR, rawP
-      )) {
+  // Unlike the previous version,
+  // ADC=0 and ADC=4095 are valid
+  // endpoint values for Yaw/Roll/Pitch.
 
-    if (!joystickPowerOK()) {
+  uint32_t finalPower =
+    readPowerMv();
 
-      stopTransmission();
+  if (!runtimePowerOK(finalPower)) {
 
-    } else {
-
-      /*
-       * Unexpected invalid ADC inputs:
-       * require a new calibration.
-       */
-
-      calibrationOK = false;
-      state = WAIT_POWER_STABLE;
-      powerStableStartMs = millis();
-
-      Serial.println(
-        "INVALID INPUTS - TX STOPPED"
-      );
-    }
+    stopTransmission(
+      "POWER LOST BEFORE TX",
+      finalPower
+    );
 
     return;
   }
 
-  /* =====================================
-   * ENCODE ORIGINAL PROTOCOL
-   * ===================================== */
+  // ----------------------------------------
+  // ORIGINAL 9-BYTE RADIO PROTOCOL
+  // ----------------------------------------
 
-  packet[0] = encodeThrottle(rawT);
+  packet[0] =
+    encodeThrottle(rawT);
 
-  packet[1] = encodeAxis(
-    rawY,
-    centerYaw,
-    0x8D,
-    INVERT_YAW
-  );
+  packet[1] =
+    encodeAxis(
+      rawY, centerYaw, 141, INVERT_YAW
+    );
 
-  packet[2] = encodeAxis(
-    rawR,
-    centerRoll,
-    0x70,
-    INVERT_ROLL
-  );
+  packet[2] =
+    encodeAxis(
+      rawR, centerRoll, 112, INVERT_ROLL
+    );
 
-  packet[3] = encodeAxis(
-    rawP,
-    centerPitch,
-    0x70,
-    INVERT_PITCH
-  );
+  packet[3] =
+    encodeAxis(
+      rawP, centerPitch, 112, INVERT_PITCH
+    );
 
   packet[4] = 0x05;
   packet[5] = 0x38;
   packet[6] = 0x00;
 
-  packet[7] = (uint8_t)(
-    txCount & 0xFF
-  );
+  packet[7] = sequenceNumber++;
 
-  packet[8] = packetChecksum(packet);
+  packet[8] = calculateChecksum();
 
-  /*
-   * Check switched power one more time
-   * immediately before radio.write().
-   */
+  // Recheck the power before sending.
 
-  if (!joystickPowerOK()) {
-    stopTransmission();
+  finalPower = readPowerMv();
+
+  if (!runtimePowerOK(finalPower)) {
+
+    stopTransmission(
+      "POWER FAULT AT TX",
+      finalPower
+    );
+
     return;
   }
 
-  bool sent = radio.write(packet, 9);
+  bool writeResult =
+    radio.write(packet, sizeof(packet));
 
+  lastTxMs = millis();
   txCount++;
 
-  /* =====================================
-   * SERIAL MONITOR
-   * ===================================== */
+  // ----------------------------------------
+  // SERIAL DIAGNOSTICS
+  // ----------------------------------------
 
   if (
-    (uint32_t)(now - lastPrintMs) >=
+    lastTxMs - lastPrintMs >=
     PRINT_INTERVAL_MS
   ) {
-    lastPrintMs = now;
+
+    lastPrintMs = lastTxMs;
+
+    uint32_t throttlePercent =
+      ((225U - packet[0]) * 100U +
+       112U) / 225U;
 
     Serial.printf(
-      "STATE=%s | POWER=%lu mV | ",
-      stateName(state),
-      (unsigned long)powerSenseMilliVolts()
-    );
+      "STATE=TX_ACTIVE | "
+      "POWER=%lu mV | "
+      "THR=%lu%% | "
+      "ADC=%u | "
+      "Y=%u R=%u P=%u | "
+      "TX=%lu | "
+      "WRITE=%s | "
+      "POWER_FAULTS=%lu\n",
 
-    Serial.printf(
-      "THR=%lu%% | ADC=%u | ",
-      (unsigned long)throttlePercent(packet[0]),
-      rawT
-    );
+      (unsigned long)finalPower,
+      (unsigned long)throttlePercent,
 
-    Serial.printf(
-      "Y=%u R=%u P=%u | ",
-      rawY, rawR, rawP
-    );
+      rawT,
+      rawY,
+      rawR,
+      rawP,
 
-    Serial.printf(
-      "TX=%lu | WRITE=%s | ",
       (unsigned long)txCount,
-      sent ? "OK" : "FAIL"
-    );
 
-    Serial.printf(
-      "LOSS=%lu\n",
-      (unsigned long)powerLossCount
+      writeResult ? "OK" : "FAIL",
+
+      (unsigned long)powerFaultCount
     );
   }
 }
