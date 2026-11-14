@@ -1,10 +1,10 @@
 
 /*
  * =====================================================
- * DRONE_ STEP 20
+ * DRONE_ STEP 21
  * STM32F050K4
  *
- * ANGLE MODE + VIRTUAL THROTTLE MIXER - BENCH DIAGNOSTICS
+ * ANGLE MODE + WIDE-TILT ATTITUDE DIAGNOSTICS
  *
  * RADIO HW-725:
  * PA15 CSN
@@ -40,7 +40,11 @@
  * SIM_ARMED + zero throttle -> all virtual mixer outputs ZERO
  * SIM_ARMED + throttle > 0 -> virtual mixer = throttle + corrections
  *
- * NO motor enable path. NOT FLIGHT-READY.
+ * Step 21: bench attitude estimation now supports approximately
+ * +/-70 degrees of single-axis roll/pitch without the artificial
+ * +/-20-degree accelerometer gate of Step 20.
+ * This is not a full 3D attitude estimator, and is NOT flight-ready.
+ * No motor enable path. NOT FLIGHT-READY.
  * =====================================================
  */
 
@@ -125,6 +129,11 @@
 
 #define RAD_TO_DEG 57.2957795f
 #define FILTER_ALPHA 0.98f
+
+/* Bench-only validity envelope. Beyond this, virtual ARM drops.
+ * MAX_ANGLE_DEG below is a separate STICK-command limit.
+ */
+#define ATTITUDE_BENCH_TILT_LIMIT_DEG 70.0f
 
 /* Angle Mode */
 
@@ -338,6 +347,10 @@ volatile float attitude_gyro_roll_deg = 0;
 volatile float attitude_gyro_pitch_deg = 0;
 
 volatile float attitude_accel_norm2 = 0;
+/* Step 21 diagnostics: 1g test and tilt limit. */
+volatile uint32_t attitude_accel_norm_ok = 0U;
+volatile uint32_t attitude_tilt_cutoff = 0U;
+volatile float attitude_max_abs_tilt_deg = 0.0f;
 
 /* =====================================================
  * LIVE EXPRESSIONS - STICKS
@@ -457,6 +470,68 @@ static float clampf(
 static float absf(float value)
 {
     return value < 0.0f ? -value : value;
+}
+
+/* =====================================================
+ * STEP 21 - FAST BENCH TRIG HELPERS
+ * =====================================================
+ * Software floating point on 8 MHz Cortex-M0. No libm required.
+ * arctan approximation is intended for diagnostic tilt estimates,
+ * not precision inertial navigation or flight control.
+ *
+ * atan(z) ~= z * [pi/4 + 0.273*(1-z)] for 0 <= z <= 1.
+ * Sign and quadrant are handled below.
+ */
+
+static float atan_ratio_bench(float z)
+{
+    /* z must be in [0,1]. */
+    return z * (0.7853981634f + 0.273f * (1.0f - z));
+}
+
+static float atan2_bench_deg(float y, float x)
+{
+    float ax = absf(x);
+    float ay = absf(y);
+    float angle;
+
+    if(ax < 0.000001f && ay < 0.000001f)
+        return 0.0f;
+
+    if(ax >= ay)
+        angle = atan_ratio_bench(ay / ax);
+    else
+        angle = 1.5707963268f - atan_ratio_bench(ax / ay);
+
+    if(x < 0.0f)
+        angle = 3.1415926536f - angle;
+
+    if(y < 0.0f)
+        angle = -angle;
+
+    return angle * RAD_TO_DEG;
+}
+
+/* Approximate hypot with two Newton iterations.
+ * For this normalized IMU application it avoids sqrtf/libm.
+ */
+static float hypot_bench(float x, float y)
+{
+    float a = absf(x);
+    float b = absf(y);
+    float hi = a > b ? a : b;
+    float lo = a > b ? b : a;
+    float ratio, n2, root;
+
+    if(hi < 0.000001f)
+        return 0.0f;
+
+    ratio = lo / hi;
+    n2 = 1.0f + ratio * ratio;
+    root = 1.0f + 0.4142135624f * ratio;
+    root = 0.5f * (root + n2 / root);
+    root = 0.5f * (root + n2 / root);
+    return hi * root;
 }
 
 /* =====================================================
@@ -1201,19 +1276,20 @@ static void attitude_update(uint32_t dt_ms)
     attitude_accel_norm2 = norm2;
 
     /*
-     * Acceleration approximately 1g.
-     * Small tilt diagnostic range.
+     * Step 21: check total acceleration magnitude, not the
+     * individual X/Y/Z projections. At 40 or 60 degrees the
+     * projection along Z naturally decreases, but total 1g
+     * should remain approximately 2048 counts for +/-16g.
+     *
+     * Static bench test only: transient linear accelerations
+     * can make this measurement unreliable.
      */
 
     accel_ok =
-        az > 1750.0f &&
-        az < 2400.0f &&
-
-        absf(ax) < 700.0f &&
-        absf(ay) < 700.0f &&
-
         norm2 > 2890000.0f &&
         norm2 < 5760000.0f;
+
+    attitude_accel_norm_ok = accel_ok;
 
     if(attitude_initialized)
     {
@@ -1235,17 +1311,21 @@ static void attitude_update(uint32_t dt_ms)
     if(accel_ok)
     {
         /*
-         * Small-angle approximation.
+         * Step 21: roll and pitch from full vector geometry.
+         * This replaces the small-angle ay/az and -ax/az,
+         * which become inaccurate when Z falls with tilt.
+         * Axis signs deliberately match verified Step 20 tests.
          *
-         * Axis signs based on the
-         * previous bench tilt tests.
+         * Roll  = atan2(ay, az).
+         * Pitch = atan2(-ax, sqrt(ay*ay + az*az)).
+         * Both are lightweight bench approximations, no libm.
          */
 
         attitude_accel_roll_deg =
-            (ay / az) * RAD_TO_DEG;
+            atan2_bench_deg(ay, az);
 
         attitude_accel_pitch_deg =
-            (-ax / az) * RAD_TO_DEG;
+            atan2_bench_deg(-ax, hypot_bench(ay, az));
 
         if(!attitude_initialized)
         {
@@ -1302,12 +1382,25 @@ static void attitude_update(uint32_t dt_ms)
         180.0f
     );
 
+    /* Reject extreme bench attitudes beyond +/-70 degrees.
+     * This keeps a conservative, visible tilt cutoff while
+     * allowing 30-60 degree static diagnostic tests.
+     */
+    attitude_max_abs_tilt_deg = absf(attitude_roll_deg);
+    if(absf(attitude_pitch_deg) > attitude_max_abs_tilt_deg)
+        attitude_max_abs_tilt_deg = absf(attitude_pitch_deg);
+
+    attitude_tilt_cutoff =
+        (attitude_max_abs_tilt_deg >
+         ATTITUDE_BENCH_TILT_LIMIT_DEG) ? 1U : 0U;
+
     attitude_valid =
         attitude_initialized &&
         ((uint32_t)(
             system_ms -
             attitude_last_accel_ms
-        ) <= 500U);
+        ) <= 500U) &&
+        (attitude_tilt_cutoff == 0U);
 }
 
 /* =====================================================
@@ -2530,7 +2623,7 @@ int main(void)
         link_update(system_ms);
 
         /*
-         * Step 20 Angle Mode
+         * Step 21 Angle Mode
          * calculations only
          */
 
