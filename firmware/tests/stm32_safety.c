@@ -1,7 +1,7 @@
 
 /*
  * =====================================================
- * DRONE_ STEP 22
+ * DRONE_ STEP 22.1 / LEVEL ZERO CALIBRATION
  * STM32F050K4
  *
  * ANGLE MODE + FAILSAFE BENCH DIAGNOSTICS
@@ -41,6 +41,7 @@
  * SIM_ARMED + throttle > 0 -> virtual mixer = throttle + corrections
  *
  * Step 21: Bench attitude estimation approximately +/-70 degrees.
+ * Step 22.1: User-requested level zero trim (RAM only).
  * Step 22: Instrumented non-motor safety checks:
  *  2201: real RF-loss observer (turn transmitter power switch OFF)
  *  2202: injected IMU read failure (latches FC_FAILSAFE, fault_code 3)
@@ -131,6 +132,12 @@
 #define RADIO_POLL_MS 10U
 #define RADIO_TIMEOUT_MS 250U
 #define CAL_COUNT 250U
+/* Separate level-zero calibration: 200 samples at 100Hz. */
+#define LEVEL_CAL_KEY 2121U
+#define LEVEL_CAL_SAMPLES 200U
+#define LEVEL_MAX_RAW_TILT_DEG 8.0f
+#define LEVEL_MAX_GYRO_DPS 2.5f
+#define LEVEL_MAX_SPREAD_DEG 1.2f
 
 #define RAD_TO_DEG 57.2957795f
 #define FILTER_ALPHA 0.98f
@@ -403,6 +410,26 @@ volatile float attitude_accel_norm2 = 0;
 volatile uint32_t attitude_accel_norm_ok = 0U;
 volatile uint32_t attitude_tilt_cutoff = 0U;
 volatile float attitude_max_abs_tilt_deg = 0.0f;
+
+/* Step 22.1: level-zero trim. Live Expressions only; values in RAM.
+ * STATUS: 0 idle, 1 collecting, 2 calibrated, 3 rejected/aborted.
+ * ERROR: 0 none, 1 preconditions, 2 motion/invalid IMU,
+ *        3 unstable samples, 4 incorrect request.
+ * Raw attitude_accel_roll_deg/pitch_deg are intentionally untrimmed.
+ */
+volatile uint32_t imu_level_cal_request = 0U;
+volatile uint32_t imu_level_cal_status = 0U;
+volatile uint32_t imu_level_cal_error = 0U;
+volatile uint32_t imu_level_cal_samples = 0U;
+volatile float imu_level_roll_zero_deg = 0.0f;
+volatile float imu_level_pitch_zero_deg = 0.0f;
+static float level_roll_sum = 0.0f;
+static float level_pitch_sum = 0.0f;
+static float level_roll_min = 0.0f;
+static float level_roll_max = 0.0f;
+static float level_pitch_min = 0.0f;
+static float level_pitch_max = 0.0f;
+
 
 /* =====================================================
  * LIVE EXPRESSIONS - STICKS
@@ -1382,10 +1409,10 @@ static void attitude_update(uint32_t dt_ms)
         if(!attitude_initialized)
         {
             attitude_roll_deg =
-                attitude_accel_roll_deg;
+                attitude_accel_roll_deg - imu_level_roll_zero_deg;
 
             attitude_pitch_deg =
-                attitude_accel_pitch_deg;
+                attitude_accel_pitch_deg - imu_level_pitch_zero_deg;
 
             attitude_gyro_roll_deg = 0;
             attitude_gyro_pitch_deg = 0;
@@ -1399,14 +1426,14 @@ static void attitude_update(uint32_t dt_ms)
                 predicted_roll +
 
                 (1.0f - FILTER_ALPHA) *
-                attitude_accel_roll_deg;
+                (attitude_accel_roll_deg - imu_level_roll_zero_deg);
 
             attitude_pitch_deg =
                 FILTER_ALPHA *
                 predicted_pitch +
 
                 (1.0f - FILTER_ALPHA) *
-                attitude_accel_pitch_deg;
+                (attitude_accel_pitch_deg - imu_level_pitch_zero_deg);
         }
 
         attitude_last_accel_ms =
@@ -2358,7 +2385,7 @@ static uint32_t sim_arm_conditions(void)
         flags |= SIM_BLOCK_IMU;
 
     if(attitude_valid != 1U || sim_ready != 1U ||
-       angle_mode_ready != 1U)
+       angle_mode_ready != 1U || imu_level_cal_status == 1U)
         flags |= SIM_BLOCK_ATTITUDE;
 
     if(radio_diag_alive != 1U ||
@@ -2453,6 +2480,108 @@ static void sim_arm_update(void)
             sim_arm_accept_counter++;
             sim_arm_last_reject_flags = 0U;
         }
+    }
+}
+
+/* =====================================================
+ * STEP 22.1 - STATIONARY LEVEL-ZERO TRIM, RAM ONLY
+ * =====================================================
+ * Flat *frame* required; gyro offset is already calibrated at
+ * boot. No motor outputs, no flash writes. Trim is an angle
+ * mounting correction, not a six-point accelerometer calibration.
+ */
+static void imu_level_cal_update(void)
+{
+    uint32_t request = imu_level_cal_request;
+    float roll, pitch;
+
+    imu_level_cal_request = 0U;
+    if(request != 0U)
+    {
+        if(request != LEVEL_CAL_KEY)
+        {
+            imu_level_cal_status = 3U;
+            imu_level_cal_error = 4U;
+            return;
+        }
+        if(core_state != 2U || fc_state != 2U ||
+           fault_code != 0U || imu_ok != 1U ||
+           calibration_status != 2U || attitude_valid != 1U ||
+           sim_arm_state != 0U ||
+           safety_test_status == STEP22_WAITING ||
+           radio_diag_alive != 1U ||
+           radio_diag_throttle != 225U)
+        {
+            imu_level_cal_status = 3U;
+            imu_level_cal_error = 1U;
+            return;
+        }
+        imu_level_cal_status = 1U;
+        imu_level_cal_error = 0U;
+        imu_level_cal_samples = 0U;
+        level_roll_sum = 0.0f;
+        level_pitch_sum = 0.0f;
+    }
+
+    if(imu_level_cal_status != 1U)
+        return;
+
+    roll = attitude_accel_roll_deg;
+    pitch = attitude_accel_pitch_deg;
+
+    if(core_state != 2U || fc_state != 2U ||
+       fault_code != 0U || imu_ok != 1U ||
+       attitude_valid != 1U || attitude_accel_norm_ok != 1U ||
+       sim_arm_state != 0U || radio_diag_alive != 1U ||
+       radio_diag_throttle != 225U ||
+       absf(roll) > LEVEL_MAX_RAW_TILT_DEG ||
+       absf(pitch) > LEVEL_MAX_RAW_TILT_DEG ||
+       absf(gyro_roll_dps) > LEVEL_MAX_GYRO_DPS ||
+       absf(gyro_pitch_dps) > LEVEL_MAX_GYRO_DPS ||
+       absf(gyro_yaw_dps) > LEVEL_MAX_GYRO_DPS)
+    {
+        imu_level_cal_status = 3U;
+        imu_level_cal_error = 2U;
+        return;
+    }
+
+    if(imu_level_cal_samples == 0U)
+    {
+        level_roll_min = roll;
+        level_roll_max = roll;
+        level_pitch_min = pitch;
+        level_pitch_max = pitch;
+    }
+
+    if(roll < level_roll_min) level_roll_min = roll;
+    if(roll > level_roll_max) level_roll_max = roll;
+    if(pitch < level_pitch_min) level_pitch_min = pitch;
+    if(pitch > level_pitch_max) level_pitch_max = pitch;
+
+    if((level_roll_max - level_roll_min) > LEVEL_MAX_SPREAD_DEG ||
+       (level_pitch_max - level_pitch_min) > LEVEL_MAX_SPREAD_DEG)
+    {
+        imu_level_cal_status = 3U;
+        imu_level_cal_error = 3U;
+        return;
+    }
+
+    level_roll_sum += roll;
+    level_pitch_sum += pitch;
+    imu_level_cal_samples++;
+
+    if(imu_level_cal_samples >= LEVEL_CAL_SAMPLES)
+    {
+        imu_level_roll_zero_deg =
+            level_roll_sum / (float)LEVEL_CAL_SAMPLES;
+        imu_level_pitch_zero_deg =
+            level_pitch_sum / (float)LEVEL_CAL_SAMPLES;
+        imu_level_cal_status = 2U;
+        imu_level_cal_error = 0U;
+        /* Re-initialize from corrected accelerometer angles
+         * on next 100Hz iteration. No false ARM is possible. */
+        attitude_initialized = 0U;
+        attitude_valid = 0U;
     }
 }
 
@@ -2874,6 +3003,9 @@ int main(void)
          */
 
         link_update(system_ms);
+
+        /* Manual level-zero calibration with physical outputs OFF. */
+        imu_level_cal_update();
 
         /*
          * Step 22 Angle Mode
