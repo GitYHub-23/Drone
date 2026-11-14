@@ -1,10 +1,10 @@
 
 /*
  * =====================================================
- * DRONE_ STEP 21
+ * DRONE_ STEP 22
  * STM32F050K4
  *
- * ANGLE MODE + WIDE-TILT ATTITUDE DIAGNOSTICS
+ * ANGLE MODE + FAILSAFE BENCH DIAGNOSTICS
  *
  * RADIO HW-725:
  * PA15 CSN
@@ -40,9 +40,14 @@
  * SIM_ARMED + zero throttle -> all virtual mixer outputs ZERO
  * SIM_ARMED + throttle > 0 -> virtual mixer = throttle + corrections
  *
- * Step 21: bench attitude estimation now supports approximately
- * +/-70 degrees of single-axis roll/pitch without the artificial
- * +/-20-degree accelerometer gate of Step 20.
+ * Step 21: Bench attitude estimation approximately +/-70 degrees.
+ * Step 22: Instrumented non-motor safety checks:
+ *  2201: real RF-loss observer (turn transmitter power switch OFF)
+ *  2202: injected IMU read failure (latches FC_FAILSAFE, fault_code 3)
+ *  2203: tilt-limit observer (tilt past 70 deg; virtual ARM drops)
+ *  watchdog_test_request=20261122: deliberate IWDG reset, last test.
+ * Test actions are explicitly requested via Live Expressions.
+ * No physical motor-enable path. Keep motors disconnected/props off.
  * This is not a full 3D attitude estimator, and is NOT flight-ready.
  * No motor enable path. NOT FLIGHT-READY.
  * =====================================================
@@ -195,6 +200,35 @@
 #define SIM_DISARM_FAULT       4U
 #define SIM_DISARM_OUTPUTS     5U
 
+/* =====================================================
+ * STEP 22 - BENCH SAFETY SELF-TESTS
+ * =====================================================
+ * To start a non-destructive test, write one of these keys
+ * to safety_test_request in Live Expressions:
+ *  2201 : real radio loss observer; toggle transmitter OFF
+ *  2202 : injected IMU read failure -> latched FAULT=3
+ *  2203 : tilt > 70 degrees observer -> virtual disarm
+ *
+ * For the IWDG reset test (LAST), write 20261122 to
+ * watchdog_test_request while disarmed, throttle minimum.
+ * No software test guarantees the motor pins during reset.
+ * Physical motor wiring MUST remain disconnected.
+ */
+#define STEP22_RADIO_LOSS_TEST 2201U
+#define STEP22_IMU_FAULT_TEST  2202U
+#define STEP22_TILT_LIMIT_TEST 2203U
+#define STEP22_WATCHDOG_KEY    20261122U
+#define STEP22_TEST_TIMEOUT_MS 15000U
+
+#define STEP22_IDLE       0U
+#define STEP22_WAITING    1U
+#define STEP22_PASS       2U
+#define STEP22_FAIL       3U
+#define STEP22_REJECTED   4U
+
+/* Failure details: 0=none, 1=preconditions, 2=timeout,
+ * 3=unexpected outcome, 4=invalid key, 5=already active. */
+
 
 /* =====================================================
  * LIVE EXPRESSIONS - SYSTEM
@@ -231,6 +265,24 @@ volatile uint32_t sim_arm_accept_counter = 0;
 volatile uint32_t sim_arm_reject_counter = 0;
 volatile uint32_t sim_disarm_counter = 0;
 volatile uint32_t sim_arm_last_disarm_reason = SIM_DISARM_NONE;
+
+/* Step 22 monitor: all test requests are one-shot. */
+volatile uint32_t safety_test_request = 0U;
+volatile uint32_t watchdog_test_request = 0U;
+volatile uint32_t safety_test_case = 0U;
+volatile uint32_t safety_test_status = STEP22_IDLE;
+volatile uint32_t safety_test_detail = 0U;
+volatile uint32_t safety_test_elapsed_ms = 0U;
+volatile uint32_t safety_test_pass_counter = 0U;
+volatile uint32_t safety_test_fail_counter = 0U;
+volatile uint32_t safety_test_reject_counter = 0U;
+volatile uint32_t safety_test_imu_inject_count = 0U;
+volatile uint32_t safety_test_start_lost_count = 0U;
+volatile uint32_t safety_test_real_outputs_off = 0U;
+
+/* Watchdog reset evidence is latched in watchdog_reset_detected. */
+static uint32_t safety_test_started_at = 0U;
+static uint32_t safety_test_imu_inject_pending = 0U;
 
 
 /* Loop diagnostics */
@@ -2405,6 +2457,193 @@ static void sim_arm_update(void)
 }
 
 /* =====================================================
+ * STEP 22 - FAILSAFE BENCH TEST CONTROLLER
+ * =====================================================
+ * The radio and tilt tests OBSERVE real data and do not mock an
+ * RX timeout or IMU angle. The IMU test injects exactly one read
+ * failure to exercise the existing fail(3) path. None of these
+ * tests can unlock motor GPIO/TIM1.
+ */
+static uint32_t step22_outputs_safe(void)
+{
+    return physical_motor_lock == 1U &&
+           outputs_verified_off == 1U &&
+           motor1_percent == 0U &&
+           motor2_percent == 0U &&
+           motor3_percent == 0U &&
+           motor4_percent == 0U &&
+           motor_off_verified();
+}
+
+static uint32_t step22_mix_is_zero(void)
+{
+    return sim_arm_state == 0U &&
+           sim_mixer_virtual_active == 0U &&
+           sim_mixer_cutoff == 1U &&
+           mix_m1_percent == 0.0f &&
+           mix_m2_percent == 0.0f &&
+           mix_m3_percent == 0.0f &&
+           mix_m4_percent == 0.0f;
+}
+
+static void step22_finish(uint32_t status, uint32_t detail)
+{
+    safety_test_status = status;
+    safety_test_detail = detail;
+    safety_test_real_outputs_off = step22_outputs_safe();
+    if(status == STEP22_PASS)
+        safety_test_pass_counter++;
+    else if(status == STEP22_FAIL)
+        safety_test_fail_counter++;
+    else if(status == STEP22_REJECTED)
+        safety_test_reject_counter++;
+}
+
+static void step22_poll(void)
+{
+    uint32_t now = system_ms;
+    uint32_t key = safety_test_request;
+    uint32_t watchdog_key = watchdog_test_request;
+    uint32_t safe = step22_outputs_safe();
+
+    safety_test_real_outputs_off = safe;
+    safety_test_request = 0U;
+    watchdog_test_request = 0U;
+
+    /* The watchdog test is intentionally separate, guarded, and LAST.
+     * A genuine IWDG timeout resets the MCU; the next boot retains
+     * its reset cause in watchdog_reset_detected, and latches fault 8.
+     */
+    if(watchdog_key != 0U)
+    {
+        if(watchdog_key != STEP22_WATCHDOG_KEY ||
+           safety_test_status == STEP22_WAITING ||
+           sim_arm_state != 0U ||
+           radio_diag_throttle != 225U ||
+           fault_code != 0U ||
+           core_state != 2U ||
+           !safe)
+        {
+            safety_test_case = 2204U;
+            step22_finish(STEP22_REJECTED, 1U);
+            return;
+        }
+        safety_test_case = 2204U;
+        safety_test_status = STEP22_WAITING;
+        safety_test_detail = 0U;
+        sim_arm_drop(SIM_DISARM_MANUAL);
+        motor_all_off();
+        /* No IWDG refresh below. SysTick and IWDG keep counting.
+         * If debugger halts the CPU, IWDG may freeze until Resume.
+         */
+        for(;;)
+            motor_hardware_off();
+    }
+
+    if(key != 0U)
+    {
+        if(safety_test_status == STEP22_WAITING)
+        {
+            safety_test_reject_counter++;
+            safety_test_detail = 5U;
+            return;
+        }
+
+        safety_test_case = key;
+        safety_test_elapsed_ms = 0U;
+        safety_test_detail = 0U;
+
+        if(key != STEP22_RADIO_LOSS_TEST &&
+           key != STEP22_IMU_FAULT_TEST &&
+           key != STEP22_TILT_LIMIT_TEST)
+        {
+            step22_finish(STEP22_REJECTED, 4U);
+            return;
+        }
+
+        /* All three tests begin from a known virtual running state.
+         * If this precondition is not met, do not alter state.
+         */
+        if(fault_code != 0U ||
+           core_state != 2U ||
+           sim_arm_state != 1U ||
+           sim_mixer_virtual_active != 1U ||
+           radio_diag_alive != 1U ||
+           attitude_valid != 1U ||
+           !safe)
+        {
+            step22_finish(STEP22_REJECTED, 1U);
+            return;
+        }
+
+        safety_test_started_at = now;
+        safety_test_start_lost_count = radio_diag_lost_count;
+        safety_test_status = STEP22_WAITING;
+        if(key == STEP22_IMU_FAULT_TEST)
+            safety_test_imu_inject_pending = 1U;
+    }
+
+    if(safety_test_status != STEP22_WAITING)
+        return;
+
+    safety_test_elapsed_ms = (uint32_t)(now - safety_test_started_at);
+
+    if(safety_test_case == STEP22_RADIO_LOSS_TEST)
+    {
+        /* Verified loss: real transmitter stops sending packets,
+         * existing receiver timeout and virtual-disarm logic run.
+         */
+        if(radio_diag_lost_count > safety_test_start_lost_count &&
+           radio_diag_alive == 0U &&
+           sim_arm_last_disarm_reason == SIM_DISARM_RADIO)
+        {
+            if(step22_mix_is_zero() && safe && fault_code == 0U)
+                step22_finish(STEP22_PASS, 0U);
+            else
+                step22_finish(STEP22_FAIL, 3U);
+        }
+    }
+    else if(safety_test_case == STEP22_TILT_LIMIT_TEST)
+    {
+        /* Independent check: large tilt must drop virtual ARM,
+         * and must not allow virtual mixer output afterward.
+         */
+        if(attitude_tilt_cutoff == 1U)
+        {
+            if(step22_mix_is_zero() && safe &&
+               sim_arm_last_disarm_reason == SIM_DISARM_HEALTH &&
+               fault_code == 0U)
+                step22_finish(STEP22_PASS, 0U);
+            else
+                step22_finish(STEP22_FAIL, 3U);
+        }
+    }
+    else if(safety_test_case == STEP22_IMU_FAULT_TEST)
+    {
+        /* The next control cycle injects one read failure and
+         * enters the existing latched failure state (fault 3).
+         */
+        if(fault_code != 0U)
+        {
+            if(fault_code == 3U && fc_state == 4U &&
+               step22_mix_is_zero() && safe &&
+               sim_arm_last_disarm_reason == SIM_DISARM_FAULT)
+                step22_finish(STEP22_PASS, 0U);
+            else
+                step22_finish(STEP22_FAIL, 3U);
+        }
+    }
+
+    if(safety_test_status == STEP22_WAITING &&
+       safety_test_elapsed_ms >= STEP22_TEST_TIMEOUT_MS)
+    {
+        step22_finish(STEP22_FAIL, 2U);
+        /* A failed diagnostic must not leave virtual ARM running. */
+        sim_arm_drop(SIM_DISARM_MANUAL);
+    }
+}
+
+/* =====================================================
  * CONTROL CYCLE
  * ===================================================== */
 
@@ -2460,6 +2699,20 @@ static void control_cycle(uint32_t elapsed)
     )
     {
         fail(99U);
+        return;
+    }
+
+    /* Step 22 fault injection enters the exact same FAULT_IMU_READ
+     * handling as an actual read failure. Does not touch hardware.
+     * A successful injection requires an STM32 reset to recover.
+     */
+    if(safety_test_imu_inject_pending != 0U)
+    {
+        safety_test_imu_inject_pending = 0U;
+        safety_test_imu_inject_count++;
+        imu_ok = 0U;
+        imu_error_counter++;
+        fail(3U);
         return;
     }
 
@@ -2623,7 +2876,7 @@ int main(void)
         link_update(system_ms);
 
         /*
-         * Step 21 Angle Mode
+         * Step 22 Angle Mode
          * calculations only
          */
 
@@ -2635,6 +2888,9 @@ int main(void)
          */
 
         sim_arm_update();
+
+        /* Step 22: requested bench-only safety diagnostics. */
+        step22_poll();
 
         /*
          * Loop diagnostics
