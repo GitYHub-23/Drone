@@ -1,7 +1,7 @@
 
 /*
  * =====================================================
- * DRONE_ STEP 22.1 / LEVEL ZERO CALIBRATION
+ * DRONE_ STEP 22.2 / PERSISTENT LEVEL ZERO CALIBRATION
  * STM32F050K4
  *
  * ANGLE MODE + FAILSAFE BENCH DIAGNOSTICS
@@ -41,13 +41,15 @@
  * SIM_ARMED + throttle > 0 -> virtual mixer = throttle + corrections
  *
  * Step 21: Bench attitude estimation approximately +/-70 degrees.
- * Step 22.1: User-requested level zero trim (RAM only).
+ * Step 22.1: User-requested level zero trim.
+ * Step 22.2: Explicit flash save and automatic restore on boot.
  * Step 22: Instrumented non-motor safety checks:
  *  2201: real RF-loss observer (turn transmitter power switch OFF)
  *  2202: injected IMU read failure (latches FC_FAILSAFE, fault_code 3)
  *  2203: tilt-limit observer (tilt past 70 deg; virtual ARM drops)
  *  watchdog_test_request=20261122: deliberate IWDG reset, last test.
  * Test actions are explicitly requested via Live Expressions.
+ * Calibration Flash page must be reserved with the supplied linker change.
  * No physical motor-enable path. Keep motors disconnected/props off.
  * This is not a full 3D attitude estimator, and is NOT flight-ready.
  * No motor enable path. NOT FLIGHT-READY.
@@ -134,6 +136,36 @@
 #define CAL_COUNT 250U
 /* Separate level-zero calibration: 200 samples at 100Hz. */
 #define LEVEL_CAL_KEY 2121U
+/* Deliberate, separate command to save a successful level calibration. */
+#define LEVEL_FLASH_SAVE_KEY 2122U
+
+/* STM32F050x4: 16 KB Flash, 1 KB erase pages. LAST page for trim only.
+ * Linker MUST limit executable FLASH to 15K AND define
+ * __drone_flash_cal_boundary__ = ORIGIN(FLASH) + LENGTH(FLASH);
+ * Flash writer refuses to run if boundary is not 0x08003C00.
+ */
+#define CAL_FLASH_PAGE_ADDR 0x08003C00U
+#define CAL_FLASH_PAGE_SIZE 1024U
+#define CAL_FLASH_MAGIC 0x4D54U
+#define CAL_FLASH_VERSION 1U
+#define CAL_FLASH_COMMIT 0xA55AU
+
+#define FLASH_KEYR REG(0x40022004U)
+#define FLASH_SR REG(0x4002200CU)
+#define FLASH_CR REG(0x40022010U)
+#define FLASH_AR REG(0x40022014U)
+#define FLASH_SR_BSY (1U << 0)
+#define FLASH_SR_PGERR (1U << 2)
+#define FLASH_SR_WRPERR (1U << 4)
+#define FLASH_SR_EOP (1U << 5)
+#define FLASH_CR_PG (1U << 0)
+#define FLASH_CR_PER (1U << 1)
+#define FLASH_CR_STRT (1U << 6)
+#define FLASH_CR_LOCK (1U << 7)
+
+/* Symbol is deliberately required: a missing linker modification
+ * causes LINK FAILURE instead of silently risking firmware erase. */
+extern const uint8_t __drone_flash_cal_boundary__;
 #define LEVEL_CAL_SAMPLES 200U
 #define LEVEL_MAX_RAW_TILT_DEG 8.0f
 #define LEVEL_MAX_GYRO_DPS 2.5f
@@ -429,6 +461,22 @@ static float level_roll_min = 0.0f;
 static float level_roll_max = 0.0f;
 static float level_pitch_min = 0.0f;
 static float level_pitch_max = 0.0f;
+
+/* Step 22.2 diagnostics:
+ * load_status: 0=pending, 1=valid saved calibration loaded,
+ *              2=blank page, 3=no valid record/invalid page.
+ * save_status: 0=idle, 1=writing, 2=stored/verified,
+ *              3=rejected or flash error.
+ * save_error: 0=none, 1=unsafe state, 2=no fresh trim,
+ *             3=bad linker layout, 5=erase/write/verify error.
+ * All requests one-shot; flash never writes automatically.
+ */
+volatile uint32_t imu_flash_save_request = 0U;
+volatile uint32_t imu_flash_load_status = 0U;
+volatile uint32_t imu_flash_save_status = 0U;
+volatile uint32_t imu_flash_save_error = 0U;
+volatile uint32_t imu_flash_record_count = 0U;
+volatile uint32_t imu_flash_erase_count = 0U;
 
 
 /* =====================================================
@@ -2484,10 +2532,244 @@ static void sim_arm_update(void)
 }
 
 /* =====================================================
- * STEP 22.1 - STATIONARY LEVEL-ZERO TRIM, RAM ONLY
+ * STEP 22.2 - PERSISTENT IMU LEVEL TRIM, FLASH PAGE 15
+ * =====================================================
+ * STM32F050x4: reserve the 1-KB page 0x08003C00..0x08003FFF.
+ * Never store calibration in code space. The custom linker symbol
+ * must point precisely to the start of this reserved page.
+ *
+ * One 16-byte calibration record per page. Saving explicitly
+ * erases that page; it should only be done occasionally. The
+ * final commit halfword and CRC16 reject interrupted writes.
+ * Losing power during save can lose the old saved trim, but
+ * cannot erase firmware if linker reservation is correct.
+ */
+
+typedef union {
+    float f;
+    uint32_t bits;
+} cal_float_bits_t;
+
+static uint16_t cal_crc16(const uint16_t words[6])
+{
+    uint16_t crc = 0xFFFFU;
+    uint32_t i, j, b;
+    for(i = 0U; i < 6U; i++)
+    {
+        uint16_t w = words[i];
+        for(j = 0U; j < 2U; j++)
+        {
+            crc ^= (uint16_t)((j == 0U ? (w & 255U) : (w >> 8U)) << 8U);
+            for(b = 0U; b < 8U; b++)
+                crc = (crc & 0x8000U) ?
+                    (uint16_t)((crc << 1U) ^ 0x1021U) :
+                    (uint16_t)(crc << 1U);
+        }
+    }
+    return crc;
+}
+
+static uint32_t cal_flash_layout_safe(void)
+{
+    return (uintptr_t)&__drone_flash_cal_boundary__ ==
+           (uintptr_t)CAL_FLASH_PAGE_ADDR;
+}
+
+static uint32_t cal_flash_record_valid(void)
+{
+    const volatile uint16_t *slot =
+        (const volatile uint16_t *)(uintptr_t)CAL_FLASH_PAGE_ADDR;
+    uint16_t words[6];
+    uint32_t i;
+    cal_float_bits_t r, p;
+
+    if(slot[0] != CAL_FLASH_MAGIC ||
+       slot[1] != CAL_FLASH_VERSION ||
+       slot[7] != CAL_FLASH_COMMIT)
+        return 0U;
+
+    for(i = 0U; i < 6U; i++) words[i] = slot[i];
+    if(slot[6] != cal_crc16(words)) return 0U;
+
+    r.bits = ((uint32_t)slot[3] << 16U) | slot[2];
+    p.bits = ((uint32_t)slot[5] << 16U) | slot[4];
+    /* Comparisons reject NaN and Infinity. */
+    return (r.f >= -LEVEL_MAX_RAW_TILT_DEG &&
+            r.f <= LEVEL_MAX_RAW_TILT_DEG &&
+            p.f >= -LEVEL_MAX_RAW_TILT_DEG &&
+            p.f <= LEVEL_MAX_RAW_TILT_DEG) ? 1U : 0U;
+}
+
+static void cal_flash_load(void)
+{
+    const volatile uint16_t *slot =
+        (const volatile uint16_t *)(uintptr_t)CAL_FLASH_PAGE_ADDR;
+    cal_float_bits_t r, p;
+    imu_flash_record_count = 0U;
+    imu_flash_load_status = 0U;
+
+    if(!cal_flash_layout_safe())
+    {
+        imu_flash_load_status = 3U;
+        return;
+    }
+    if(cal_flash_record_valid())
+    {
+        r.bits = ((uint32_t)slot[3] << 16U) | slot[2];
+        p.bits = ((uint32_t)slot[5] << 16U) | slot[4];
+        imu_level_roll_zero_deg = r.f;
+        imu_level_pitch_zero_deg = p.f;
+        imu_level_cal_status = 2U;
+        imu_level_cal_samples = 0U; /* Loaded, not freshly sampled */
+        imu_flash_record_count = 1U;
+        imu_flash_load_status = 1U;
+    }
+    else
+    {
+        imu_flash_load_status = (slot[0] == 0xFFFFU) ? 2U : 3U;
+    }
+}
+
+static uint32_t cal_flash_wait(void)
+{
+    uint32_t spins = 1000000U;
+    while((FLASH_SR & FLASH_SR_BSY) != 0U)
+        if(--spins == 0U) return 0U;
+    return (FLASH_SR & (FLASH_SR_PGERR | FLASH_SR_WRPERR)) == 0U;
+}
+
+static void cal_flash_lock(void)
+{
+    FLASH_CR |= FLASH_CR_LOCK;
+}
+
+static uint32_t cal_flash_write(const uint16_t words[8])
+{
+    uint32_t i;
+    uintptr_t addr = (uintptr_t)CAL_FLASH_PAGE_ADDR;
+
+    if((FLASH_CR & FLASH_CR_LOCK) != 0U)
+    {
+        FLASH_KEYR = 0x45670123U;
+        FLASH_KEYR = 0xCDEF89ABU;
+    }
+    if((FLASH_CR & FLASH_CR_LOCK) != 0U) return 0U;
+
+    /* Mandatory erase: all program operations must target 0xFFFF. */
+    FLASH_SR = FLASH_SR_EOP | FLASH_SR_PGERR | FLASH_SR_WRPERR;
+    FLASH_CR |= FLASH_CR_PER;
+    FLASH_AR = CAL_FLASH_PAGE_ADDR;
+    FLASH_CR |= FLASH_CR_STRT;
+    if(!cal_flash_wait())
+    {
+        FLASH_CR &= ~FLASH_CR_PER;
+        cal_flash_lock();
+        return 0U;
+    }
+    FLASH_CR &= ~FLASH_CR_PER;
+    FLASH_SR = FLASH_SR_EOP;
+    imu_flash_erase_count++;
+
+    for(i = 0U; i < 8U; i++)
+    {
+        FLASH_CR |= FLASH_CR_PG;
+        *(volatile uint16_t *)(addr + 2U * i) = words[i];
+        if(!cal_flash_wait())
+        {
+            FLASH_CR &= ~FLASH_CR_PG;
+            cal_flash_lock();
+            return 0U;
+        }
+        FLASH_CR &= ~FLASH_CR_PG;
+        FLASH_SR = FLASH_SR_EOP;
+        if(*(volatile uint16_t *)(addr + 2U * i) != words[i])
+        {
+            cal_flash_lock();
+            return 0U;
+        }
+    }
+    cal_flash_lock();
+    return cal_flash_record_valid();
+}
+
+static void cal_flash_save_update(void)
+{
+    uint32_t request = imu_flash_save_request;
+    uint16_t words[8];
+    cal_float_bits_t r, p;
+
+    imu_flash_save_request = 0U;
+    if(request == 0U) return;
+    imu_flash_save_status = 3U;
+    imu_flash_save_error = 1U;
+
+    if(request != LEVEL_FLASH_SAVE_KEY ||
+       core_state != 2U || fc_state != 2U || fault_code != 0U ||
+       sim_arm_state != 0U || imu_ok != 1U ||
+       calibration_status != 2U || attitude_valid != 1U ||
+       radio_diag_alive != 1U || radio_diag_throttle != 225U ||
+       physical_motor_lock != 1U || outputs_verified_off != 1U ||
+       safety_test_status == STEP22_WAITING)
+        return;
+
+    imu_flash_save_error = 2U;
+    if(imu_level_cal_status != 2U ||
+       imu_level_cal_samples != LEVEL_CAL_SAMPLES ||
+       !(imu_level_roll_zero_deg >= -LEVEL_MAX_RAW_TILT_DEG &&
+         imu_level_roll_zero_deg <= LEVEL_MAX_RAW_TILT_DEG &&
+         imu_level_pitch_zero_deg >= -LEVEL_MAX_RAW_TILT_DEG &&
+         imu_level_pitch_zero_deg <= LEVEL_MAX_RAW_TILT_DEG))
+        return;
+
+    imu_flash_save_error = 3U;
+    if(!cal_flash_layout_safe()) return;
+
+    r.f = imu_level_roll_zero_deg;
+    p.f = imu_level_pitch_zero_deg;
+    words[0] = CAL_FLASH_MAGIC;
+    words[1] = CAL_FLASH_VERSION;
+    words[2] = (uint16_t)r.bits;
+    words[3] = (uint16_t)(r.bits >> 16U);
+    words[4] = (uint16_t)p.bits;
+    words[5] = (uint16_t)(p.bits >> 16U);
+    words[6] = cal_crc16(words);
+    words[7] = CAL_FLASH_COMMIT;
+
+    /* No erase if exactly these values are already stored. */
+    if(cal_flash_record_valid())
+    {
+        const volatile uint16_t *slot =
+            (const volatile uint16_t *)(uintptr_t)CAL_FLASH_PAGE_ADDR;
+        if(slot[2] == words[2] && slot[3] == words[3] &&
+           slot[4] == words[4] && slot[5] == words[5])
+        {
+            imu_flash_save_error = 0U;
+            imu_flash_save_status = 2U;
+            return;
+        }
+    }
+
+    imu_flash_save_status = 1U;
+    imu_flash_save_error = 5U;
+    /* Keep watchdog running; power must be stable during erase. */
+    watchdog_feed();
+    if(!cal_flash_write(words))
+    {
+        imu_flash_save_status = 3U;
+        return;
+    }
+
+    imu_flash_record_count = 1U;
+    imu_flash_save_error = 0U;
+    imu_flash_save_status = 2U;
+}
+
+/* =====================================================
+ * STEP 22.1 - STATIONARY LEVEL-ZERO TRIM
  * =====================================================
  * Flat *frame* required; gyro offset is already calibrated at
- * boot. No motor outputs, no flash writes. Trim is an angle
+ * boot. No motor outputs; saving Flash requires separate 2122 key.
+ * Trim is an angle
  * mounting correction, not a six-point accelerometer calibration.
  */
 static void imu_level_cal_update(void)
@@ -2959,6 +3241,9 @@ int main(void)
     motor_all_off();
     watchdog_feed();
 
+    /* Load preserved level trim (read-only; never erases on boot). */
+    cal_flash_load();
+
     last_loop = system_ms;
 
     /* =================================================
@@ -3006,6 +3291,9 @@ int main(void)
 
         /* Manual level-zero calibration with physical outputs OFF. */
         imu_level_cal_update();
+
+        /* Explicit 2122 request saves the 200-sample level trim. */
+        cal_flash_save_update();
 
         /*
          * Step 22 Angle Mode
@@ -3059,3 +3347,4 @@ int main(void)
         watchdog_feed();
     }
 }
+
