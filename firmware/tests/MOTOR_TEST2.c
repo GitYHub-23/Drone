@@ -1,210 +1,227 @@
+
 /*
- * ============================================================
- * DRONE_ - STEP 4.3
- * STM32F031K4 + M540
+ * DRONE_ STEP 26
+ * STM32F031K4Ux
  *
- * 200 Hz RATE PID DRY RUN
+ * REAL CONTINUOUS 4-MOTOR BENCH CONTROL
  *
- * VERIFIED / CORRECTED:
- *   ROLL  mixer corrected
- *   PITCH mixer corrected
+ * M1 PA11 TIM1_CH4
+ * M2 PA9  TIM1_CH2
+ * M3 PA8  TIM1_CH1
+ * M4 PA10 TIM1_CH3
  *
- * CURRENT TEST:
- *   YAW direction
+ * RADIO:
+ * PA15 CSN
+ * PB3  SCK
+ * PB4  MISO
+ * PB5  MOSI
+ * PB6  CE
  *
- * ABSOLUTE SAFETY:
- *   REAL MOTORS ARE ALWAYS 0%.
+ * IMU M540:
+ * PB7 SDA
+ * PB8 SCL
+ * ADDRESS 0x69
+ * WHO_AM_I 0x7D
  *
- * Geometry:
- *
- *                  FRONT
- *                    ^
- *
- *             M2 CCW     M1 CW
- *             LEFT       RIGHT
- *
- *             M3 CW      M4 CCW
- *             LEFT       RIGHT
- *
- * Electrical mapping:
- *   PA8  TIM1_CH1 -> M3
- *   PA9  TIM1_CH2 -> M2
- *   PA10 TIM1_CH3 -> M4
- *   PA11 TIM1_CH4 -> M1
- *
- * IMU:
- *   M540
- *   PB7 = SDA
- *   PB8 = SCL
- *   I2C address = 0x69
- *   WHO_AM_I = 0x7D
- *
- * ============================================================
+ * IMPORTANT:
+ * Bench firmware, not flight-qualified.
+ * Propellers OFF for first powered tests.
+ * Never halt debugger while motors are powered.
+ * Hardware motor-power disconnect required.
  */
 
 #include <stdint.h>
 
+/* REGISTERS */
 
-/* ============================================================
- * REGISTER ACCESS
- * ============================================================ */
+#define REG(a) (*(volatile uint32_t *)(uintptr_t)(a))
 
-#define REG32(addr) (*(volatile uint32_t *)(uintptr_t)(addr))
+#define RCC_CR       REG(0x40021000U)
+#define RCC_CFGR     REG(0x40021004U)
+#define RCC_AHBENR   REG(0x40021014U)
+#define RCC_APB2ENR  REG(0x40021018U)
+#define RCC_APB1ENR  REG(0x4002101CU)
+#define RCC_APB1RSTR REG(0x40021010U)
+#define RCC_CFGR3    REG(0x40021030U)
+#define RCC_CSR      REG(0x40021024U)
 
+#define GA 0x48000000U
+#define GB 0x48000400U
 
-/* ============================================================
- * RCC
- * ============================================================ */
+#define MODER(b)   REG((b)+0x00U)
+#define OTYPER(b)  REG((b)+0x04U)
+#define OSPEEDR(b) REG((b)+0x08U)
+#define PUPDR(b)   REG((b)+0x0CU)
+#define ODR(b)     REG((b)+0x14U)
+#define BSRR(b)    REG((b)+0x18U)
+#define AFRL(b)    REG((b)+0x20U)
+#define AFRH(b)    REG((b)+0x24U)
 
-#define RCC_AHBENR      REG32(0x40021014U)
-#define RCC_APB2RSTR    REG32(0x4002100CU)
-#define RCC_APB1RSTR    REG32(0x40021010U)
-#define RCC_APB2ENR     REG32(0x40021018U)
-#define RCC_APB1ENR     REG32(0x4002101CU)
-#define RCC_CFGR3       REG32(0x40021030U)
+#define SYST_CSR REG(0xE000E010U)
+#define SYST_RVR REG(0xE000E014U)
+#define SYST_CVR REG(0xE000E018U)
 
-#define GPIOA_EN        (1U << 17)
-#define GPIOB_EN        (1U << 18)
+#define TIM1_CR1   REG(0x40012C00U)
+#define TIM1_EGR   REG(0x40012C14U)
+#define TIM1_CCMR1 REG(0x40012C18U)
+#define TIM1_CCMR2 REG(0x40012C1CU)
+#define TIM1_CCER  REG(0x40012C20U)
+#define TIM1_PSC   REG(0x40012C28U)
+#define TIM1_ARR   REG(0x40012C2CU)
+#define TIM1_CCR1  REG(0x40012C34U)
+#define TIM1_CCR2  REG(0x40012C38U)
+#define TIM1_CCR3  REG(0x40012C3CU)
+#define TIM1_CCR4  REG(0x40012C40U)
+#define TIM1_BDTR  REG(0x40012C44U)
 
-#define TIM1_EN         (1U << 11)
-#define I2C1_EN         (1U << 21)
+#define I2C_CR1    REG(0x40005400U)
+#define I2C_CR2    REG(0x40005404U)
+#define I2C_TIMING REG(0x40005410U)
+#define I2C_ISR    REG(0x40005418U)
+#define I2C_ICR    REG(0x4000541CU)
+#define I2C_RXDR   REG(0x40005424U)
+#define I2C_TXDR   REG(0x40005428U)
 
+#define SPI_CR1 REG(0x40013000U)
+#define SPI_CR2 REG(0x40013004U)
+#define SPI_SR  REG(0x40013008U)
 
-/* ============================================================
- * GPIO
- * ============================================================ */
+#define SPI_DR8 \
+ (*(volatile uint8_t *)(uintptr_t)0x4001300CU)
 
-#define GPIOA_BASE      0x48000000U
-#define GPIOB_BASE      0x48000400U
+#define IWDG_KR REG(0x40003000U)
+#define IWDG_PR REG(0x40003004U)
+#define IWDG_RLR REG(0x40003008U)
+#define IWDG_SR REG(0x4000300CU)
+#define IWDG_WINR REG(0x40003010U)
 
-#define GPIO_MODER(base)    REG32((base) + 0x00U)
-#define GPIO_OTYPER(base)   REG32((base) + 0x04U)
-#define GPIO_OSPEEDR(base)  REG32((base) + 0x08U)
-#define GPIO_PUPDR(base)    REG32((base) + 0x0CU)
-#define GPIO_BSRR(base)     REG32((base) + 0x18U)
-#define GPIO_AFRL(base)     REG32((base) + 0x20U)
-#define GPIO_AFRH(base)     REG32((base) + 0x24U)
+#define DBGMCU_APB1_FZ REG(0x40015808U)
 
+/* CONFIGURATION */
 
-/* ============================================================
- * SYSTICK
- * ============================================================ */
+#define MOTOR_MASK (0xFU << 8U)
+#define MOTOR_MODE_MASK (0xFFU << 16U)
+#define MOTOR_GPIO_MODE (0x55U << 16U)
+#define MOTOR_AF_MODE (0xAAU << 16U)
 
-#define SYST_CSR        REG32(0xE000E010U)
-#define SYST_RVR        REG32(0xE000E014U)
-#define SYST_CVR        REG32(0xE000E018U)
+#define LOOP_PERIOD_MS 10U
+#define RADIO_POLL_MS 10U
+#define RADIO_TIMEOUT_MS 150U
+#define RADIO_ARM_MAX_AGE_MS 80U
+
+#define GYRO_CAL_SAMPLES 250U
+
+#define MAX_ANGLE_DEG 20.0f
+#define MAX_RATE_DPS 90.0f
+#define MAX_YAW_DPS 60.0f
+
+#define ANGLE_KP 3.0f
+#define ROLL_KP 0.060f
+#define PITCH_KP 0.060f
+#define YAW_KP 0.050f
+
+#define MAX_CORRECTION_PERCENT 6.0f
+#define MAX_YAW_CORRECTION_PERCENT 5.0f
+
+/*
+ * Bench motor power:
+ *
+ * 0% stick = outputs OFF
+ * At active throttle, base duty rises
+ * from about 15% to a maximum of 55%.
+ *
+ * These are PWM duty values, not
+ * measured motor RPM or thrust.
+ */
+
+#define MOTOR_MIN_PM 150U
+#define MOTOR_MAX_PM 550U
+#define MOTOR_SLEW_PM 12U
+#define MOTOR_START_THR_PERCENT 4.0f
+
+#define ARM_HOLD_MS 1200U
+#define DISARM_HOLD_MS 400U
+
+#define ARM_YAW_RAW 210U
+#define DISARM_YAW_RAW 30U
+
+#define ARM_MAX_TILT_DEG 10.0f
+#define MOTOR_MAX_TILT_DEG 70.0f
+
+#define RAD_TO_DEG 57.2957795f
+#define FILTER_ALPHA 0.98f
+
+/*
+ * Saved calibration from Step 22.2.
+ * Last 1 KB Flash page remains reserved.
+ * Step 26 reads but never erases it.
+ */
+
+#define CAL_FLASH_ADDR 0x08003C00U
+#define CAL_MAGIC 0x4D54U
+#define CAL_VERSION 1U
+#define CAL_COMMIT 0xA55AU
+
+extern const uint8_t __drone_flash_cal_boundary__;
+
+/* FLIGHT CONTROLLER STATE */
+
+#define FC_BOOT 0U
+#define FC_CALIBRATING 1U
+#define FC_DISARMED 2U
+#define FC_ARMED 3U
+#define FC_FAULT 4U
+
+/* FAILSAFE REASONS */
+
+#define DISARM_NONE 0U
+#define DISARM_STICK 1U
+#define DISARM_RADIO 2U
+#define DISARM_IMU 3U
+#define DISARM_TILT 4U
+#define DISARM_DEBUG 5U
+#define DISARM_TIMING 6U
+
+/* LIVE EXPRESSIONS */
 
 volatile uint32_t system_ms = 0U;
 
+volatile uint32_t fc_state = FC_BOOT;
+volatile uint32_t fault_code = 0U;
 
-/* ============================================================
- * I2C1
- * ============================================================ */
+volatile uint32_t arm_state = 0U;
+volatile uint32_t sim_arm_state = 0U;
 
-#define I2C1_BASE       0x40005400U
+volatile uint32_t disarm_request = 0U;
+volatile uint32_t arm_counter = 0U;
+volatile uint32_t disarm_counter = 0U;
+volatile uint32_t last_disarm_reason = DISARM_NONE;
 
-#define I2C1_CR1        REG32(I2C1_BASE + 0x00U)
-#define I2C1_CR2        REG32(I2C1_BASE + 0x04U)
-#define I2C1_TIMINGR    REG32(I2C1_BASE + 0x10U)
-#define I2C1_ISR        REG32(I2C1_BASE + 0x18U)
-#define I2C1_ICR        REG32(I2C1_BASE + 0x1CU)
-#define I2C1_RXDR       REG32(I2C1_BASE + 0x24U)
-#define I2C1_TXDR       REG32(I2C1_BASE + 0x28U)
+volatile uint32_t arm_gesture_progress_ms = 0U;
+volatile uint32_t disarm_gesture_progress_ms = 0U;
 
-#define I2C_CR1_PE      (1U << 0)
+volatile uint32_t physical_motor_lock = 1U;
+volatile uint32_t outputs_verified_off = 1U;
+volatile uint32_t motor_pwm_active = 0U;
 
-#define I2C_CR2_RD_WRN  (1U << 10)
-#define I2C_CR2_START   (1U << 13)
-#define I2C_CR2_AUTOEND (1U << 25)
+volatile uint32_t motor1_pwm_permille = 0U;
+volatile uint32_t motor2_pwm_permille = 0U;
+volatile uint32_t motor3_pwm_permille = 0U;
+volatile uint32_t motor4_pwm_permille = 0U;
 
-#define I2C_ISR_TXIS    (1U << 1)
-#define I2C_ISR_RXNE    (1U << 2)
-#define I2C_ISR_NACKF   (1U << 4)
-#define I2C_ISR_STOPF   (1U << 5)
-#define I2C_ISR_TC      (1U << 6)
-#define I2C_ISR_BERR    (1U << 8)
-#define I2C_ISR_ARLO    (1U << 9)
-#define I2C_ISR_OVR     (1U << 10)
-#define I2C_ISR_BUSY    (1U << 15)
+volatile float mix_m1_percent = 0.0f;
+volatile float mix_m2_percent = 0.0f;
+volatile float mix_m3_percent = 0.0f;
+volatile float mix_m4_percent = 0.0f;
 
-#define I2C_ICR_NACKCF  (1U << 4)
-#define I2C_ICR_STOPCF  (1U << 5)
-#define I2C_ICR_BERRCF  (1U << 8)
-#define I2C_ICR_ARLOCF  (1U << 9)
-#define I2C_ICR_OVRCF   (1U << 10)
-
-
-/* ============================================================
- * TIM1
- * ============================================================ */
-
-#define TIM1_BASE       0x40012C00U
-
-#define TIM1_CR1        REG32(TIM1_BASE + 0x00U)
-#define TIM1_EGR        REG32(TIM1_BASE + 0x14U)
-#define TIM1_CCMR1      REG32(TIM1_BASE + 0x18U)
-#define TIM1_CCMR2      REG32(TIM1_BASE + 0x1CU)
-#define TIM1_CCER       REG32(TIM1_BASE + 0x20U)
-
-#define TIM1_PSC        REG32(TIM1_BASE + 0x28U)
-#define TIM1_ARR        REG32(TIM1_BASE + 0x2CU)
-
-#define TIM1_CCR1       REG32(TIM1_BASE + 0x34U)
-#define TIM1_CCR2       REG32(TIM1_BASE + 0x38U)
-#define TIM1_CCR3       REG32(TIM1_BASE + 0x3CU)
-#define TIM1_CCR4       REG32(TIM1_BASE + 0x40U)
-
-#define TIM1_BDTR       REG32(TIM1_BASE + 0x44U)
-
-
-/* ============================================================
- * M540
- * ============================================================ */
-
-#define M540_ADDR           0x69U
-
-#define M540_REG_ACCEL      0x3BU
-#define M540_REG_CONFIG     0x1AU
-#define M540_REG_GYRO_CFG   0x1BU
-#define M540_REG_ACCEL_CFG  0x1CU
-#define M540_REG_ACCEL_CFG2 0x1DU
-#define M540_REG_PWR_MGMT   0x6BU
-#define M540_REG_WHO_AM_I   0x75U
-
-#define M540_WHO_VALUE      0x7DU
-
-#define GYRO_LSB_PER_DPS    16.4f
-
-
-/* ============================================================
- * CONTROL
- * ============================================================ */
-
-#define LOOP_PERIOD_MS      5U
-
-#define TEST_BASE_THROTTLE  50.0f
-
-#define ROLL_KP             0.10f
-#define PITCH_KP            0.10f
-#define YAW_KP              0.08f
-
-#define PID_LIMIT           35.0f
-
-#define YAW_TRIGGER_DPS     20.0f
-#define YAW_CAPTURE_MS      700U
-#define YAW_ARM_DELAY_MS    1500U
-
-
-/* ============================================================
- * IMU DEBUG
- * ============================================================ */
+volatile float pid_roll_output = 0.0f;
+volatile float pid_pitch_output = 0.0f;
+volatile float pid_yaw_output = 0.0f;
 
 volatile uint32_t imu_ok = 0U;
-volatile uint8_t imu_whoami = 0U;
-
+volatile uint32_t imu_whoami = 0U;
 volatile uint32_t imu_frame_counter = 0U;
 volatile uint32_t imu_error_counter = 0U;
-volatile uint32_t imu_consecutive_errors = 0U;
 
 volatile int16_t accel_x = 0;
 volatile int16_t accel_y = 0;
@@ -214,24 +231,6 @@ volatile int16_t gyro_x = 0;
 volatile int16_t gyro_y = 0;
 volatile int16_t gyro_z = 0;
 
-
-/* ============================================================
- * I2C DEBUG
- * ============================================================ */
-
-volatile uint32_t i2c_hw_enabled = 0U;
-volatile uint32_t i2c_last_error = 0U;
-volatile uint32_t i2c_berr_counter = 0U;
-volatile uint32_t i2c_transfer_counter = 0U;
-
-volatile uint32_t i2c_isr_debug = 0U;
-volatile uint32_t i2c_timingr_debug = 0U;
-
-
-/* ============================================================
- * CALIBRATION
- * ============================================================ */
-
 volatile uint32_t calibration_status = 0U;
 volatile uint32_t calibration_samples = 0U;
 
@@ -239,1737 +238,1638 @@ volatile float gyro_x_offset = 0.0f;
 volatile float gyro_y_offset = 0.0f;
 volatile float gyro_z_offset = 0.0f;
 
-
-/* ============================================================
- * GYRO
- * ============================================================ */
-
 volatile float gyro_roll_dps = 0.0f;
 volatile float gyro_pitch_dps = 0.0f;
 volatile float gyro_yaw_dps = 0.0f;
 
+volatile float attitude_roll_deg = 0.0f;
+volatile float attitude_pitch_deg = 0.0f;
 
-/* ============================================================
- * PID
- * ============================================================ */
+volatile uint32_t attitude_valid = 0U;
+volatile uint32_t attitude_accel_norm_ok = 0U;
+volatile uint32_t attitude_tilt_cutoff = 0U;
 
-volatile float pid_roll_output = 0.0f;
-volatile float pid_pitch_output = 0.0f;
-volatile float pid_yaw_output = 0.0f;
+volatile float imu_level_roll_zero_deg = 0.0f;
+volatile float imu_level_pitch_zero_deg = 0.0f;
+volatile uint32_t imu_flash_load_status = 0U;
 
+volatile uint32_t radio_spi_initialized = 0U;
+volatile uint32_t radio_spi_error_counter = 0U;
+volatile uint32_t radio_rx_configured = 0U;
+volatile uint32_t radio_rx_config_error = 0U;
+volatile uint32_t radio_rx_invalid_packets = 0U;
+volatile uint32_t radio_packets_received = 0U;
 
-/* ============================================================
- * VIRTUAL MOTOR MIXER
- * ============================================================ */
+volatile uint32_t radio_diag_alive = 0U;
+volatile uint32_t radio_diag_age_ms = UINT32_MAX;
+volatile uint32_t radio_diag_lost_count = 0U;
+volatile uint32_t radio_diag_last_seq = 0U;
 
-volatile float mix_m1_percent = 50.0f;
-volatile float mix_m2_percent = 50.0f;
-volatile float mix_m3_percent = 50.0f;
-volatile float mix_m4_percent = 50.0f;
+volatile uint32_t radio_diag_throttle = 225U;
+volatile uint32_t radio_diag_yaw = 141U;
+volatile uint32_t radio_diag_roll = 112U;
+volatile uint32_t radio_diag_pitch = 112U;
 
+volatile float sim_throttle_percent = 0.0f;
+volatile float sim_roll_stick = 0.0f;
+volatile float sim_pitch_stick = 0.0f;
+volatile float sim_yaw_stick = 0.0f;
 
-/* ============================================================
- * REAL MOTOR DEBUG
- * ============================================================ */
-
-volatile uint32_t motor1_percent = 0U;
-volatile uint32_t motor2_percent = 0U;
-volatile uint32_t motor3_percent = 0U;
-volatile uint32_t motor4_percent = 0U;
-
-volatile uint32_t physical_motor_lock = 1U;
-
-
-/* ============================================================
- * LOOP DEBUG
- * ============================================================ */
-
+volatile uint32_t loop_counter = 0U;
 volatile uint32_t loop_dt_ms = 0U;
-volatile uint32_t loop_dt_max_ms = 0U;
+volatile uint32_t loop_overrun_counter = 0U;
 
-volatile float loop_dt = 0.005f;
-volatile float loop_hz = 200.0f;
+volatile uint32_t reset_cause = 0U;
+volatile uint32_t watchdog_reset_detected = 0U;
 
-volatile uint32_t imu_read_time_ms = 0U;
-volatile uint32_t imu_read_time_max_ms = 0U;
+/* INTERNAL STATE */
 
+static uint32_t i2c_started_ms = 0U;
+static uint32_t last_radio_poll_ms = 0U;
+static uint32_t last_valid_radio_ms = 0U;
+static uint32_t radio_seen = 0U;
+static uint32_t radio_have_seq = 0U;
+static uint8_t previous_seq = 0U;
 
-/* ============================================================
- * YAW DIAGNOSTIC
- *
- * state:
- *
- * 0 = startup delay
- * 1 = armed / waiting / capturing
- * 2 = finished / frozen
- * ============================================================ */
+static uint32_t gyro_cal_started_ms = 0U;
+static int32_t gyro_sums[3];
+static int16_t gyro_min[3];
+static int16_t gyro_max[3];
 
-volatile uint32_t yaw_diag_state = 0U;
+static uint32_t attitude_initialized = 0U;
+static uint32_t last_accel_valid_ms = 0U;
 
-volatile int32_t yaw_diag_first_sign = 0;
+static uint32_t arm_hold_start_ms = 0U;
+static uint32_t disarm_hold_start_ms = 0U;
+static uint32_t arm_hold_active = 0U;
+static uint32_t disarm_hold_active = 0U;
 
-volatile float yaw_diag_first_gyro_dps = 0.0f;
-volatile float yaw_diag_peak_gyro_dps = 0.0f;
+static uint16_t applied_pwm[4] = {0,0,0,0};
 
-volatile float yaw_diag_pid_at_peak = 0.0f;
+/* HELPERS */
 
-volatile float yaw_diag_roll_pid_at_peak = 0.0f;
-volatile float yaw_diag_pitch_pid_at_peak = 0.0f;
-
-volatile float yaw_diag_m1_at_peak = 0.0f;
-volatile float yaw_diag_m2_at_peak = 0.0f;
-volatile float yaw_diag_m3_at_peak = 0.0f;
-volatile float yaw_diag_m4_at_peak = 0.0f;
-
-volatile uint32_t yaw_diag_capture_remaining_ms = 0U;
-
-
-/* ============================================================
- * HELPERS
- * ============================================================ */
-
-static float absf_local(float x)
+static float clampf(float v, float lo, float hi)
 {
-    if (x < 0.0f)
-    {
-        return -x;
-    }
-
-    return x;
+    if(v < lo) return lo;
+    if(v > hi) return hi;
+    return v;
 }
 
-
-static float clampf_local(
-    float value,
-    float min_value,
-    float max_value
-)
+static float absf(float v)
 {
-    if (value < min_value)
-    {
-        return min_value;
-    }
-
-    if (value > max_value)
-    {
-        return max_value;
-    }
-
-    return value;
+    return v < 0.0f ? -v : v;
 }
 
-
-/* ============================================================
- * GPIO HELPERS
- * ============================================================ */
-
-static void gpio_high(uint32_t base, uint32_t pin)
+static float atan_ratio(float z)
 {
-    GPIO_BSRR(base) = (1U << pin);
+    return z * (0.7853981634f + 0.273f * (1.0f-z));
 }
 
-
-static void gpio_low(uint32_t base, uint32_t pin)
+static float atan2_fast(float y, float x)
 {
-    GPIO_BSRR(base) = (1U << (pin + 16U));
+    float ax = absf(x);
+    float ay = absf(y);
+    float a;
+
+    if(ax < 0.000001f && ay < 0.000001f)
+        return 0.0f;
+
+    if(ax >= ay)
+        a = atan_ratio(ay / ax);
+    else
+        a = 1.5707963268f - atan_ratio(ax / ay);
+
+    if(x < 0.0f)
+        a = 3.1415926536f - a;
+
+    if(y < 0.0f)
+        a = -a;
+
+    return a * RAD_TO_DEG;
 }
 
-
-static void gpio_output(uint32_t base, uint32_t pin)
+static float hypot_fast(float x, float y)
 {
-    uint32_t shift;
+    float a = absf(x);
+    float b = absf(y);
+    float hi = a > b ? a : b;
+    float lo = a > b ? b : a;
+    float ratio, n, root;
 
-    shift = pin * 2U;
+    if(hi < 0.000001f) return 0.0f;
 
-    GPIO_MODER(base) &= ~(3U << shift);
-    GPIO_MODER(base) |=  (1U << shift);
+    ratio = lo / hi;
+    n = 1.0f + ratio*ratio;
+
+    root = 1.0f + 0.4142135624f*ratio;
+    root = 0.5f*(root+n/root);
+    root = 0.5f*(root+n/root);
+
+    return hi*root;
 }
 
+/* MOTOR HARDWARE */
 
-/* ============================================================
- * SYSTICK
- * ============================================================ */
-
-void SysTick_Handler(void)
+static void motor_hardware_off(void)
 {
-    system_ms++;
-}
+    RCC_AHBENR |= (1U << 17);
+    RCC_APB2ENR |= (1U << 11);
 
+    (void)RCC_AHBENR;
+    (void)RCC_APB2ENR;
 
-static void systick_init(void)
-{
-    /*
-     * CPU = 8 MHz
-     * 1 ms SysTick
-     */
-
-    SYST_RVR = 7999U;
-    SYST_CVR = 0U;
-
-    SYST_CSR =
-        (1U << 2) |
-        (1U << 1) |
-        (1U << 0);
-}
-
-
-static void delay_ms(uint32_t delay)
-{
-    uint32_t start;
-
-    start = system_ms;
-
-    while ((uint32_t)(system_ms - start) < delay)
-    {
-        /* wait */
-    }
-}
-
-
-/* ============================================================
- * MOTOR SAFE GPIO
- * ============================================================ */
-
-static void motor_gpio_prepare_low(void)
-{
-    uint32_t pin;
-
-    for (pin = 8U; pin <= 11U; pin++)
-    {
-        gpio_low(GPIOA_BASE, pin);
-        gpio_output(GPIOA_BASE, pin);
-    }
-}
-
-
-/* ============================================================
- * TIM1
- * ============================================================ */
-
-static void tim1_init(void)
-{
-    uint32_t afr;
-
-    RCC_APB2ENR |= TIM1_EN;
-
-    RCC_APB2RSTR |= TIM1_EN;
-    RCC_APB2RSTR &= ~TIM1_EN;
-
-    /*
-     * PA8..PA11 alternate function
-     */
-
-    GPIO_MODER(GPIOA_BASE) &= ~(
-        (3U << 16U) |
-        (3U << 18U) |
-        (3U << 20U) |
-        (3U << 22U)
-    );
-
-    GPIO_MODER(GPIOA_BASE) |= (
-        (2U << 16U) |
-        (2U << 18U) |
-        (2U << 20U) |
-        (2U << 22U)
-    );
-
-    /*
-     * Push-pull
-     */
-
-    GPIO_OTYPER(GPIOA_BASE) &= ~(
-        (1U << 8U) |
-        (1U << 9U) |
-        (1U << 10U) |
-        (1U << 11U)
-    );
-
-    /*
-     * AF2
-     */
-
-    afr = GPIO_AFRH(GPIOA_BASE);
-
-    afr &= ~(
-        (0xFU << 0U) |
-        (0xFU << 4U) |
-        (0xFU << 8U) |
-        (0xFU << 12U)
-    );
-
-    afr |= (
-        (2U << 0U) |
-        (2U << 4U) |
-        (2U << 8U) |
-        (2U << 12U)
-    );
-
-    GPIO_AFRH(GPIOA_BASE) = afr;
-
-    /*
-     * 1 kHz diagnostic PWM
-     */
-
-    TIM1_PSC = 0U;
-    TIM1_ARR = 7999U;
-
-    /*
-     * PWM mode 1 + preload
-     */
-
-    TIM1_CCMR1 = 0x6868U;
-    TIM1_CCMR2 = 0x6868U;
-
-    TIM1_CCER = 0x1111U;
-
-    /*
-     * REAL MOTORS OFF
-     */
+    TIM1_BDTR = 0U;
+    TIM1_CCER = 0U;
+    TIM1_CR1 = 0U;
 
     TIM1_CCR1 = 0U;
     TIM1_CCR2 = 0U;
     TIM1_CCR3 = 0U;
     TIM1_CCR4 = 0U;
 
-    TIM1_BDTR = (1U << 15);
+    BSRR(GA) = MOTOR_MASK << 16U;
+
+    OTYPER(GA) &= ~MOTOR_MASK;
+
+    PUPDR(GA) =
+        (PUPDR(GA) & ~MOTOR_MODE_MASK) |
+        (0xAAU << 16U);
+
+    MODER(GA) =
+        (MODER(GA) & ~MOTOR_MODE_MASK) |
+        MOTOR_GPIO_MODE;
+}
+
+void SystemInit(void)
+{
+    motor_hardware_off();
+}
+
+static void motor_stop(void)
+{
+    uint32_t i;
+
+    motor_hardware_off();
+
+    for(i=0U;i<4U;i++)
+        applied_pwm[i] = 0U;
+
+    motor1_pwm_permille = 0U;
+    motor2_pwm_permille = 0U;
+    motor3_pwm_permille = 0U;
+    motor4_pwm_permille = 0U;
+
+    motor_pwm_active = 0U;
+    physical_motor_lock = 1U;
+    outputs_verified_off = 1U;
+}
+
+/* PWM = 1 kHz, TIM1 at 8 MHz */
+
+static void motor_pwm_start(void)
+{
+    motor_hardware_off();
+
+    TIM1_PSC = 0U;
+    TIM1_ARR = 7999U;
+
+    TIM1_CCMR1 = 0x6868U;
+    TIM1_CCMR2 = 0x6868U;
+
+    TIM1_CCR1 = 0U;
+    TIM1_CCR2 = 0U;
+    TIM1_CCR3 = 0U;
+    TIM1_CCR4 = 0U;
 
     TIM1_EGR = 1U;
 
-    TIM1_CR1 =
-        (1U << 7) |
-        (1U << 0);
+    /* AF2 on PA8..PA11 */
+
+    AFRH(GA) =
+        (AFRH(GA) & ~0xFFFFU) |
+        0x2222U;
+
+    MODER(GA) =
+        (MODER(GA) & ~MOTOR_MODE_MASK) |
+        MOTOR_AF_MODE;
+
+    /* Enable all 4 channels */
+
+    TIM1_CCER = 0x1111U;
+    TIM1_BDTR = (1U << 15);
+    TIM1_CR1 = (1U << 7) | 1U;
+
+    motor_pwm_active = 1U;
+    physical_motor_lock = 0U;
+    outputs_verified_off = 0U;
 }
 
-
-/* ============================================================
- * ABSOLUTE MOTOR OFF
- * ============================================================ */
-
-static void motor_all_off(void)
+static uint16_t slew_pwm(uint16_t old, uint16_t target)
 {
+    if(target > old)
+    {
+        if(target-old > MOTOR_SLEW_PM)
+            return old+MOTOR_SLEW_PM;
+    }
+    else
+    {
+        if(old-target > MOTOR_SLEW_PM)
+            return old-MOTOR_SLEW_PM;
+    }
+
+    return target;
+}
+
+static uint16_t percent_to_pm(float percent)
+{
+    float v = clampf(percent,0.0f,55.0f);
+    return (uint16_t)(v*10.0f);
+}
+
+static void motor_write(
+    float m1,
+    float m2,
+    float m3,
+    float m4)
+{
+    uint16_t targets[4];
+    uint32_t i;
+
+    targets[0] = percent_to_pm(m1);
+    targets[1] = percent_to_pm(m2);
+    targets[2] = percent_to_pm(m3);
+    targets[3] = percent_to_pm(m4);
+
+    for(i=0U;i<4U;i++)
+        applied_pwm[i] =
+            slew_pwm(applied_pwm[i],targets[i]);
+
+    if(!motor_pwm_active)
+        motor_pwm_start();
+
     /*
+     * Verified physical mapping:
+     *
      * CCR1 -> M3
      * CCR2 -> M2
      * CCR3 -> M4
      * CCR4 -> M1
      */
 
-    TIM1_CCR1 = 0U;
-    TIM1_CCR2 = 0U;
-    TIM1_CCR3 = 0U;
-    TIM1_CCR4 = 0U;
+    TIM1_CCR1 = (uint32_t)applied_pwm[2]*8U;
+    TIM1_CCR2 = (uint32_t)applied_pwm[1]*8U;
+    TIM1_CCR3 = (uint32_t)applied_pwm[3]*8U;
+    TIM1_CCR4 = (uint32_t)applied_pwm[0]*8U;
 
-    motor1_percent = 0U;
-    motor2_percent = 0U;
-    motor3_percent = 0U;
-    motor4_percent = 0U;
+    motor1_pwm_permille = applied_pwm[0];
+    motor2_pwm_permille = applied_pwm[1];
+    motor3_pwm_permille = applied_pwm[2];
+    motor4_pwm_permille = applied_pwm[3];
 }
 
+/* SYSTEM */
 
-/* ============================================================
- * I2C HELPERS
- * ============================================================ */
-
-static void i2c_clear_flags(void)
+void SysTick_Handler(void)
 {
-    I2C1_ICR =
-        I2C_ICR_NACKCF |
-        I2C_ICR_STOPCF |
-        I2C_ICR_BERRCF |
-        I2C_ICR_ARLOCF |
-        I2C_ICR_OVRCF;
+    system_ms++;
 }
 
-
-static uint32_t i2c_check_errors(void)
+static void delay_ms(uint32_t ms)
 {
-    uint32_t isr;
+    uint32_t t=system_ms;
+    while((uint32_t)(system_ms-t)<ms) {}
+}
 
-    isr = I2C1_ISR;
+static uint32_t clock_init(void)
+{
+    uint32_t budget=200000U;
 
-    i2c_isr_debug = isr;
+    RCC_CR |= 1U;
 
-    /*
-     * STM32F031 spurious BERR handling
-     */
-
-    if ((isr & I2C_ISR_BERR) != 0U)
+    while(!(RCC_CR & 2U))
     {
-        I2C1_ICR = I2C_ICR_BERRCF;
-
-        i2c_berr_counter++;
+        if(--budget==0U) return 0U;
     }
 
-    if ((isr & I2C_ISR_NACKF) != 0U)
+    RCC_CFGR &= ~3U;
+
+    budget=200000U;
+
+    while(RCC_CFGR & (3U<<2))
     {
-        I2C1_ICR = I2C_ICR_NACKCF;
-
-        i2c_last_error = 1U;
-
-        return 0U;
+        if(--budget==0U) return 0U;
     }
 
-    if ((isr & I2C_ISR_ARLO) != 0U)
-    {
-        I2C1_ICR = I2C_ICR_ARLOCF;
+    RCC_CFGR &= ~((0xFU<<4)|(7U<<8));
 
-        i2c_last_error = 2U;
-
-        return 0U;
-    }
-
-    if ((isr & I2C_ISR_OVR) != 0U)
-    {
-        I2C1_ICR = I2C_ICR_OVRCF;
-
-        i2c_last_error = 3U;
-
-        return 0U;
-    }
+    SYST_RVR=7999U;
+    SYST_CVR=0U;
+    SYST_CSR=7U;
 
     return 1U;
 }
 
-
-static uint32_t i2c_wait_flag(uint32_t flag)
+static uint32_t watchdog_init(void)
 {
-    uint32_t start;
+    uint32_t t;
 
-    start = system_ms;
+    RCC_APB2ENR |= (1U<<22);
+    (void)RCC_APB2ENR;
 
-    while ((I2C1_ISR & flag) == 0U)
+    DBGMCU_APB1_FZ |= (1U<<12);
+
+    IWDG_KR=0xCCCCU;
+    IWDG_KR=0x5555U;
+    IWDG_PR=4U;
+    IWDG_RLR=624U;
+
+    t=system_ms;
+
+    while(IWDG_SR & 7U)
     {
-        if (i2c_check_errors() == 0U)
-        {
+        if((uint32_t)(system_ms-t)>=100U)
             return 0U;
-        }
-
-        if ((uint32_t)(system_ms - start) >= 10U)
-        {
-            i2c_last_error = 4U;
-
-            return 0U;
-        }
     }
 
+    IWDG_WINR=0xFFFU;
+
+    t=system_ms;
+
+    while(IWDG_SR & 7U)
+    {
+        if((uint32_t)(system_ms-t)>=100U)
+            return 0U;
+    }
+
+    IWDG_KR=0xAAAAU;
     return 1U;
 }
 
-
-static uint32_t i2c_wait_not_busy(void)
+static void watchdog_feed(void)
 {
-    uint32_t start;
-
-    start = system_ms;
-
-    while ((I2C1_ISR & I2C_ISR_BUSY) != 0U)
-    {
-        if ((uint32_t)(system_ms - start) >= 10U)
-        {
-            i2c_last_error = 5U;
-
-            return 0U;
-        }
-    }
-
-    return 1U;
+    IWDG_KR=0xAAAAU;
 }
 
-
-/* ============================================================
- * I2C GPIO
- * ============================================================ */
-
-static void i2c_gpio_init(void)
+static void fail(uint32_t code)
 {
-    uint32_t value;
+    motor_stop();
 
-    /*
-     * PB7 = SDA
-     * PB8 = SCL
-     */
+    if(fault_code==0U)
+        fault_code=code;
 
-    GPIO_MODER(GPIOB_BASE) &= ~(
-        (3U << 14U) |
-        (3U << 16U)
-    );
+    arm_state=0U;
+    sim_arm_state=0U;
 
-    GPIO_MODER(GPIOB_BASE) |= (
-        (2U << 14U) |
-        (2U << 16U)
-    );
-
-    /*
-     * Open drain
-     */
-
-    GPIO_OTYPER(GPIOB_BASE) |= (
-        (1U << 7U) |
-        (1U << 8U)
-    );
-
-    /*
-     * High speed
-     */
-
-    GPIO_OSPEEDR(GPIOB_BASE) |= (
-        (3U << 14U) |
-        (3U << 16U)
-    );
-
-    /*
-     * Pull-ups
-     */
-
-    GPIO_PUPDR(GPIOB_BASE) &= ~(
-        (3U << 14U) |
-        (3U << 16U)
-    );
-
-    GPIO_PUPDR(GPIOB_BASE) |= (
-        (1U << 14U) |
-        (1U << 16U)
-    );
-
-    /*
-     * PB7 AF1
-     */
-
-    value = GPIO_AFRL(GPIOB_BASE);
-
-    value &= ~(0xFU << 28U);
-    value |=  (1U << 28U);
-
-    GPIO_AFRL(GPIOB_BASE) = value;
-
-    /*
-     * PB8 AF1
-     */
-
-    value = GPIO_AFRH(GPIOB_BASE);
-
-    value &= ~(0xFU << 0U);
-    value |=  (1U << 0U);
-
-    GPIO_AFRH(GPIOB_BASE) = value;
+    fc_state=FC_FAULT;
 }
 
+void HardFault_Handler(void)
+{
+    motor_hardware_off();
+    for(;;) {}
+}
 
-/* ============================================================
- * I2C INIT
- * ============================================================ */
+void NMI_Handler(void)
+{
+    motor_hardware_off();
+    for(;;) {}
+}
+
+/* I2C */
 
 static void i2c_init(void)
 {
-    i2c_gpio_init();
+    RCC_AHBENR |= (1U<<18);
 
-    /*
-     * I2C1 source = HSI
-     */
+    MODER(GB)=
+        (MODER(GB)&~((3U<<14)|(3U<<16))) |
+        ((2U<<14)|(2U<<16));
 
-    RCC_CFGR3 &= ~(1U << 4U);
+    OTYPER(GB) |= (1U<<7)|(1U<<8);
+    OSPEEDR(GB) |= (3U<<14)|(3U<<16);
 
-    RCC_APB1ENR |= I2C1_EN;
+    PUPDR(GB)=
+        (PUPDR(GB)&~((3U<<14)|(3U<<16))) |
+        ((1U<<14)|(1U<<16));
 
-    RCC_APB1RSTR |= I2C1_EN;
-    RCC_APB1RSTR &= ~I2C1_EN;
+    AFRL(GB)=
+        (AFRL(GB)&~(0xFU<<28)) |
+        (1U<<28);
 
-    I2C1_CR1 &= ~I2C_CR1_PE;
+    AFRH(GB)=
+        (AFRH(GB)&~0xFU)|1U;
 
-    /*
-     * 8 MHz kernel
-     * ~100 kHz Standard Mode
-     */
+    RCC_CFGR3 &= ~(1U<<4);
 
-    I2C1_TIMINGR = 0x10420F13U;
+    RCC_APB1ENR |= (1U<<21);
+    RCC_APB1RSTR |= (1U<<21);
+    RCC_APB1RSTR &= ~(1U<<21);
 
-    i2c_timingr_debug = I2C1_TIMINGR;
+    I2C_CR1=0U;
+    I2C_TIMING=0x10420F13U;
 
-    i2c_clear_flags();
+    I2C_ICR=
+        (1U<<4)|(1U<<5)|
+        (1U<<8)|(1U<<9)|(1U<<10);
 
-    I2C1_CR1 |= I2C_CR1_PE;
-
-    i2c_hw_enabled = 1U;
+    I2C_CR1=1U;
 }
 
-
-/* ============================================================
- * M540 WRITE
- * ============================================================ */
-
-static uint32_t m540_write_reg(
-    uint8_t reg,
-    uint8_t value
-)
+static uint32_t i2c_wait(uint32_t flag)
 {
-    uint32_t cr2;
-
-    if (i2c_wait_not_busy() == 0U)
+    for(;;)
     {
-        return 0U;
+        uint32_t s=I2C_ISR;
+
+        if(s&(1U<<8))
+            I2C_ICR=(1U<<8);
+
+        if(s&((1U<<4)|(1U<<9)|(1U<<10)))
+            return 0U;
+
+        if(s&flag)
+            return 1U;
+
+        if((uint32_t)(system_ms-i2c_started_ms)>=4U)
+            return 0U;
     }
+}
 
-    i2c_last_error = 0U;
-
-    i2c_clear_flags();
-
-    cr2 =
-        ((uint32_t)M540_ADDR << 1U) |
-        (2U << 16U) |
-        I2C_CR2_AUTOEND |
-        I2C_CR2_START;
-
-    I2C1_CR2 = cr2;
-
-    if (i2c_wait_flag(I2C_ISR_TXIS) == 0U)
+static uint32_t i2c_ready(void)
+{
+    while(I2C_ISR&(1U<<15))
     {
-        return 0U;
+        if((uint32_t)(system_ms-i2c_started_ms)>=4U)
+            return 0U;
     }
-
-    I2C1_TXDR = reg;
-
-    if (i2c_wait_flag(I2C_ISR_TXIS) == 0U)
-    {
-        return 0U;
-    }
-
-    I2C1_TXDR = value;
-
-    if (i2c_wait_flag(I2C_ISR_STOPF) == 0U)
-    {
-        return 0U;
-    }
-
-    I2C1_ICR = I2C_ICR_STOPCF;
-
-    i2c_transfer_counter++;
 
     return 1U;
 }
 
-
-/* ============================================================
- * M540 READ
- * ============================================================ */
-
-static uint32_t m540_read_regs(
-    uint8_t reg,
-    uint8_t *buffer,
-    uint32_t length
-)
+static uint32_t imu_write(uint8_t reg,uint8_t value)
 {
-    uint32_t cr2;
+    i2c_started_ms=system_ms;
+
+    if(!i2c_ready()) return 0U;
+
+    I2C_ICR=
+        (1U<<4)|(1U<<5)|
+        (1U<<8)|(1U<<9)|(1U<<10);
+
+    I2C_CR2=
+        (0x69U<<1)|(2U<<16)|
+        (1U<<25)|(1U<<13);
+
+    if(!i2c_wait(1U<<1)) return 0U;
+    I2C_TXDR=reg;
+
+    if(!i2c_wait(1U<<1)) return 0U;
+    I2C_TXDR=value;
+
+    if(!i2c_wait(1U<<5)) return 0U;
+
+    I2C_ICR=(1U<<5);
+    return 1U;
+}
+
+static uint32_t imu_read(
+    uint8_t reg,
+    uint8_t *data,
+    uint32_t count)
+{
     uint32_t i;
 
-    if ((length == 0U) || (length > 255U))
-    {
+    if(count==0U || count>255U)
         return 0U;
-    }
 
-    if (i2c_wait_not_busy() == 0U)
+    i2c_started_ms=system_ms;
+
+    if(!i2c_ready()) return 0U;
+
+    I2C_ICR=
+        (1U<<4)|(1U<<5)|
+        (1U<<8)|(1U<<9)|(1U<<10);
+
+    I2C_CR2=
+        (0x69U<<1)|(1U<<16)|(1U<<13);
+
+    if(!i2c_wait(1U<<1)) return 0U;
+    I2C_TXDR=reg;
+
+    if(!i2c_wait(1U<<6)) return 0U;
+
+    I2C_CR2=
+        (0x69U<<1)|(count<<16)|
+        (1U<<10)|(1U<<25)|(1U<<13);
+
+    for(i=0U;i<count;i++)
     {
-        return 0U;
+        if(!i2c_wait(1U<<2)) return 0U;
+        data[i]=(uint8_t)I2C_RXDR;
     }
 
-    i2c_last_error = 0U;
+    if(!i2c_wait(1U<<5)) return 0U;
 
-    i2c_clear_flags();
-
-    /*
-     * Register address write
-     */
-
-    cr2 =
-        ((uint32_t)M540_ADDR << 1U) |
-        (1U << 16U) |
-        I2C_CR2_START;
-
-    I2C1_CR2 = cr2;
-
-    if (i2c_wait_flag(I2C_ISR_TXIS) == 0U)
-    {
-        return 0U;
-    }
-
-    I2C1_TXDR = reg;
-
-    if (i2c_wait_flag(I2C_ISR_TC) == 0U)
-    {
-        return 0U;
-    }
-
-    /*
-     * Repeated START + READ
-     */
-
-    cr2 =
-        ((uint32_t)M540_ADDR << 1U) |
-        (length << 16U) |
-        I2C_CR2_RD_WRN |
-        I2C_CR2_AUTOEND |
-        I2C_CR2_START;
-
-    I2C1_CR2 = cr2;
-
-    for (i = 0U; i < length; i++)
-    {
-        if (i2c_wait_flag(I2C_ISR_RXNE) == 0U)
-        {
-            return 0U;
-        }
-
-        buffer[i] = (uint8_t)I2C1_RXDR;
-    }
-
-    if (i2c_wait_flag(I2C_ISR_STOPF) == 0U)
-    {
-        return 0U;
-    }
-
-    I2C1_ICR = I2C_ICR_STOPCF;
-
-    i2c_transfer_counter++;
-
+    I2C_ICR=(1U<<5);
     return 1U;
 }
 
-
-/* ============================================================
- * M540 INIT
- * ============================================================ */
-
-static uint32_t m540_init(void)
+static uint32_t imu_init(void)
 {
-    uint8_t who;
+    uint8_t who=0U;
 
-    /*
-     * Reset
-     */
-
-    if (m540_write_reg(
-            M540_REG_PWR_MGMT,
-            0x80U
-        ) == 0U)
-    {
-        return 0U;
-    }
-
+    if(!imu_write(0x6B,0x80)) return 0U;
     delay_ms(100U);
 
-    /*
-     * Wake
-     */
+    if(!imu_write(0x6B,0x01)) return 0U;
+    delay_ms(20U);
 
-    if (m540_write_reg(
-            M540_REG_PWR_MGMT,
-            0x01U
-        ) == 0U)
-    {
-        return 0U;
-    }
+    if(!imu_write(0x1C,0x18)) return 0U;
+    if(!imu_write(0x1D,0x05)) return 0U;
+    if(!imu_write(0x1B,0x18)) return 0U;
+    if(!imu_write(0x1A,0x00)) return 0U;
 
     delay_ms(20U);
 
-    /*
-     * Accel +-16g
-     */
-
-    if (m540_write_reg(
-            M540_REG_ACCEL_CFG,
-            0x18U
-        ) == 0U)
-    {
+    if(!imu_read(0x75,&who,1U))
         return 0U;
-    }
 
-    /*
-     * Accel filter
-     */
+    imu_whoami=who;
 
-    if (m540_write_reg(
-            M540_REG_ACCEL_CFG2,
-            0x05U
-        ) == 0U)
-    {
-        return 0U;
-    }
-
-    /*
-     * Gyro +-2000 dps
-     */
-
-    if (m540_write_reg(
-            M540_REG_GYRO_CFG,
-            0x18U
-        ) == 0U)
-    {
-        return 0U;
-    }
-
-    if (m540_write_reg(
-            M540_REG_CONFIG,
-            0x00U
-        ) == 0U)
-    {
-        return 0U;
-    }
-
-    delay_ms(20U);
-
-    if (m540_read_regs(
-            M540_REG_WHO_AM_I,
-            &who,
-            1U
-        ) == 0U)
-    {
-        return 0U;
-    }
-
-    imu_whoami = who;
-
-    if (who != M540_WHO_VALUE)
-    {
-        return 0U;
-    }
-
-    return 1U;
+    return who==0x7DU;
 }
 
-
-/* ============================================================
- * M540 RAW
- * ============================================================ */
-
-static uint32_t m540_read_raw(void)
+static uint32_t imu_sample(void)
 {
-    uint8_t data[14];
+    uint8_t d[14];
 
-    if (m540_read_regs(
-            M540_REG_ACCEL,
-            data,
-            14U
-        ) == 0U)
-    {
+    if(!imu_read(0x3B,d,14U))
         return 0U;
-    }
 
-    accel_x =
-        (int16_t)(
-            ((uint16_t)data[0] << 8U) |
-            data[1]
-        );
+    accel_x=(int16_t)(((uint16_t)d[0]<<8)|d[1]);
+    accel_y=(int16_t)(((uint16_t)d[2]<<8)|d[3]);
+    accel_z=(int16_t)(((uint16_t)d[4]<<8)|d[5]);
 
-    accel_y =
-        (int16_t)(
-            ((uint16_t)data[2] << 8U) |
-            data[3]
-        );
-
-    accel_z =
-        (int16_t)(
-            ((uint16_t)data[4] << 8U) |
-            data[5]
-        );
-
-    /*
-     * data[6..7] = temperature
-     */
-
-    gyro_x =
-        (int16_t)(
-            ((uint16_t)data[8] << 8U) |
-            data[9]
-        );
-
-    gyro_y =
-        (int16_t)(
-            ((uint16_t)data[10] << 8U) |
-            data[11]
-        );
-
-    gyro_z =
-        (int16_t)(
-            ((uint16_t)data[12] << 8U) |
-            data[13]
-        );
+    gyro_x=(int16_t)(((uint16_t)d[8]<<8)|d[9]);
+    gyro_y=(int16_t)(((uint16_t)d[10]<<8)|d[11]);
+    gyro_z=(int16_t)(((uint16_t)d[12]<<8)|d[13]);
 
     imu_frame_counter++;
 
+    if(accel_x==0 && accel_y==0 && accel_z==0 &&
+       gyro_x==0 && gyro_y==0 && gyro_z==0)
+        return 0U;
+
+    if(gyro_x>=32760 || gyro_x<=-32760 ||
+       gyro_y>=32760 || gyro_y<=-32760 ||
+       gyro_z>=32760 || gyro_z<=-32760)
+        return 0U;
+
     return 1U;
 }
 
+/* GYRO CALIBRATION */
 
-/* ============================================================
- * GYRO CALIBRATION
- * ============================================================ */
-
-static uint32_t gyro_calibrate(void)
+static void gyro_cal_start(void)
 {
     uint32_t i;
-    uint32_t valid;
 
-    int32_t sum_x;
-    int32_t sum_y;
-    int32_t sum_z;
-
-    sum_x = 0;
-    sum_y = 0;
-    sum_z = 0;
-
-    valid = 0U;
-
-    calibration_status = 1U;
-    calibration_samples = 0U;
-
-    /*
-     * Keep drone completely still.
-     */
-
-    for (i = 0U; i < 500U; i++)
+    for(i=0U;i<3U;i++)
     {
-        if (m540_read_raw() != 0U)
+        gyro_sums[i]=0;
+        gyro_min[i]=INT16_MAX;
+        gyro_max[i]=INT16_MIN;
+    }
+
+    calibration_status=1U;
+    calibration_samples=0U;
+
+    gyro_cal_started_ms=system_ms;
+    fc_state=FC_CALIBRATING;
+}
+
+static void gyro_cal_update(void)
+{
+    int16_t v[3]={gyro_x,gyro_y,gyro_z};
+    uint32_t i;
+
+    if((uint32_t)(system_ms-gyro_cal_started_ms)>4000U)
+    {
+        calibration_status=3U;
+        fail(2U);
+        return;
+    }
+
+    for(i=0U;i<3U;i++)
+    {
+        if(v[i]<gyro_min[i]) gyro_min[i]=v[i];
+        if(v[i]>gyro_max[i]) gyro_max[i]=v[i];
+
+        if((int32_t)gyro_max[i]-
+           (int32_t)gyro_min[i]>164 ||
+           v[i]>1312 || v[i]<-1312)
         {
-            sum_x += gyro_x;
-            sum_y += gyro_y;
-            sum_z += gyro_z;
-
-            valid++;
-
-            calibration_samples = valid;
+            calibration_status=3U;
+            fail(2U);
+            return;
         }
 
-        delay_ms(3U);
+        gyro_sums[i]+=v[i];
     }
 
-    if (valid < 450U)
+    calibration_samples++;
+
+    if(calibration_samples>=GYRO_CAL_SAMPLES)
     {
-        calibration_status = 3U;
+        gyro_x_offset=
+            (float)gyro_sums[0]/GYRO_CAL_SAMPLES;
 
-        return 0U;
+        gyro_y_offset=
+            (float)gyro_sums[1]/GYRO_CAL_SAMPLES;
+
+        gyro_z_offset=
+            (float)gyro_sums[2]/GYRO_CAL_SAMPLES;
+
+        calibration_status=2U;
+        fc_state=FC_DISARMED;
+    }
+}
+
+/* RESTORE SAVED LEVEL TRIM */
+
+typedef union {
+    float f;
+    uint32_t bits;
+} float_bits_t;
+
+static uint16_t crc16_words(const uint16_t words[6])
+{
+    uint16_t crc=0xFFFFU;
+    uint32_t i,j,b;
+
+    for(i=0U;i<6U;i++)
+    {
+        uint16_t w=words[i];
+
+        for(j=0U;j<2U;j++)
+        {
+            crc^=(uint16_t)(
+                ((j==0U)?(w&255U):(w>>8U))<<8U
+            );
+
+            for(b=0U;b<8U;b++)
+            {
+                crc=(crc&0x8000U)
+                    ?(uint16_t)((crc<<1U)^0x1021U)
+                    :(uint16_t)(crc<<1U);
+            }
+        }
     }
 
-    gyro_x_offset =
-        (float)sum_x /
-        (float)valid;
+    return crc;
+}
 
-    gyro_y_offset =
-        (float)sum_y /
-        (float)valid;
+static void load_level_calibration(void)
+{
+    const volatile uint16_t *slot=
+        (const volatile uint16_t *)(uintptr_t)CAL_FLASH_ADDR;
 
-    gyro_z_offset =
-        (float)sum_z /
-        (float)valid;
+    uint16_t words[6];
+    uint32_t i;
+    float_bits_t r,p;
 
-    calibration_status = 2U;
+    imu_flash_load_status=3U;
+
+    if((uintptr_t)&__drone_flash_cal_boundary__ !=
+       (uintptr_t)CAL_FLASH_ADDR)
+        return;
+
+    if(slot[0]==0xFFFFU)
+    {
+        imu_flash_load_status=2U;
+        return;
+    }
+
+    if(slot[0]!=CAL_MAGIC ||
+       slot[1]!=CAL_VERSION ||
+       slot[7]!=CAL_COMMIT)
+        return;
+
+    for(i=0U;i<6U;i++)
+        words[i]=slot[i];
+
+    if(slot[6]!=crc16_words(words))
+        return;
+
+    r.bits=((uint32_t)slot[3]<<16U)|slot[2];
+    p.bits=((uint32_t)slot[5]<<16U)|slot[4];
+
+    if(!(r.f>=-8.0f && r.f<=8.0f &&
+         p.f>=-8.0f && p.f<=8.0f))
+        return;
+
+    imu_level_roll_zero_deg=r.f;
+    imu_level_pitch_zero_deg=p.f;
+
+    imu_flash_load_status=1U;
+}
+
+/* ATTITUDE */
+
+static void attitude_update(uint32_t dt_ms)
+{
+    float dt;
+    float ax,ay,az,norm2;
+    float gr,gp;
+    float accel_roll,accel_pitch;
+    uint32_t norm_ok;
+
+    attitude_valid=0U;
+
+    if(calibration_status!=2U || imu_ok!=1U)
+        return;
+
+    dt=(float)dt_ms*0.001f;
+
+    if(dt<=0.0f || dt>0.020f)
+        return;
+
+    gr=((float)gyro_x-gyro_x_offset)/16.4f;
+    gp=((float)gyro_y-gyro_y_offset)/16.4f;
+
+    gyro_roll_dps=gr;
+    gyro_pitch_dps=gp;
+    gyro_yaw_dps=
+        ((float)gyro_z-gyro_z_offset)/16.4f;
+
+    ax=(float)accel_x;
+    ay=(float)accel_y;
+    az=(float)accel_z;
+
+    norm2=ax*ax+ay*ay+az*az;
+
+    norm_ok=
+        norm2>2890000.0f &&
+        norm2<5760000.0f;
+
+    attitude_accel_norm_ok=norm_ok;
+
+    if(norm_ok)
+    {
+        accel_roll=
+            atan2_fast(ay,az)-
+            imu_level_roll_zero_deg;
+
+        accel_pitch=
+            atan2_fast(-ax,hypot_fast(ay,az))-
+            imu_level_pitch_zero_deg;
+
+        if(!attitude_initialized)
+        {
+            attitude_roll_deg=accel_roll;
+            attitude_pitch_deg=accel_pitch;
+            attitude_initialized=1U;
+        }
+        else
+        {
+            attitude_roll_deg=
+                FILTER_ALPHA*
+                (attitude_roll_deg+gr*dt)+
+                (1.0f-FILTER_ALPHA)*accel_roll;
+
+            attitude_pitch_deg=
+                FILTER_ALPHA*
+                (attitude_pitch_deg+gp*dt)+
+                (1.0f-FILTER_ALPHA)*accel_pitch;
+        }
+
+        last_accel_valid_ms=system_ms;
+    }
+    else if(attitude_initialized)
+    {
+        attitude_roll_deg+=gr*dt;
+        attitude_pitch_deg+=gp*dt;
+    }
+
+    attitude_roll_deg=
+        clampf(attitude_roll_deg,-180.0f,180.0f);
+
+    attitude_pitch_deg=
+        clampf(attitude_pitch_deg,-180.0f,180.0f);
+
+    attitude_tilt_cutoff=
+        (absf(attitude_roll_deg)>MOTOR_MAX_TILT_DEG ||
+         absf(attitude_pitch_deg)>MOTOR_MAX_TILT_DEG)
+        ?1U:0U;
+
+    attitude_valid=
+        attitude_initialized &&
+        ((uint32_t)(system_ms-last_accel_valid_ms)<=500U) &&
+        !attitude_tilt_cutoff;
+}
+
+/* SPI / NRF24 */
+
+static void spi_init(void)
+{
+    RCC_AHBENR |= (1U<<17)|(1U<<18);
+    RCC_APB2ENR |= (1U<<12);
+
+    (void)RCC_AHBENR;
+    (void)RCC_APB2ENR;
+
+    BSRR(GA)=(1U<<15);
+    BSRR(GB)=(1U<<22);
+
+    OTYPER(GA)&=~(1U<<15);
+
+    OTYPER(GB)&=~(
+        (1U<<3)|(1U<<5)|(1U<<6)
+    );
+
+    MODER(GA)=
+        (MODER(GA)&~(3U<<30))|
+        (1U<<30);
+
+    MODER(GB)=
+        (MODER(GB)&~(
+            (3U<<6)|(3U<<8)|
+            (3U<<10)|(3U<<12)
+        ))|
+        ((2U<<6)|(2U<<8)|
+         (2U<<10)|(1U<<12));
+
+    PUPDR(GB)&=~(
+        (3U<<6)|(3U<<8)|
+        (3U<<10)|(3U<<12)
+    );
+
+    OSPEEDR(GB)|=(3U<<6)|(3U<<10);
+
+    AFRL(GB)&=~(
+        (0xFU<<12)|
+        (0xFU<<16)|
+        (0xFU<<20)
+    );
+
+    SPI_CR1=0U;
+    SPI_CR2=(7U<<8)|(1U<<12);
+
+    SPI_CR1=
+        (1U<<2)|
+        (4U<<3)|
+        (1U<<8)|
+        (1U<<9)|
+        (1U<<6);
+
+    radio_spi_initialized=1U;
+}
+
+static uint32_t spi_wait(uint32_t flag,uint32_t required)
+{
+    uint32_t t=system_ms;
+
+    for(;;)
+    {
+        if(((SPI_SR&flag)!=0U)==(required!=0U))
+            return 1U;
+
+        if((uint32_t)(system_ms-t)>=2U)
+            return 0U;
+    }
+}
+
+static uint32_t spi_byte(uint8_t tx,uint8_t *rx)
+{
+    if(!spi_wait(2U,1U)) return 0U;
+
+    SPI_DR8=tx;
+
+    if(!spi_wait(1U,1U)) return 0U;
+
+    *rx=SPI_DR8;
 
     return 1U;
 }
 
-
-/* ============================================================
- * UPDATE GYRO
- * ============================================================ */
-
-static void gyro_update(void)
+static uint32_t spi_xfer(
+    const uint8_t *tx,
+    uint8_t *rx,
+    uint32_t count)
 {
-    gyro_roll_dps =
-        (
-            (float)gyro_x -
-            gyro_x_offset
-        )
-        /
-        GYRO_LSB_PER_DPS;
+    uint32_t i;
+    uint32_t ok=1U;
 
-    gyro_pitch_dps =
-        (
-            (float)gyro_y -
-            gyro_y_offset
-        )
-        /
-        GYRO_LSB_PER_DPS;
+    if(count==0U || count>11U)
+        return 0U;
 
-    gyro_yaw_dps =
-        (
-            (float)gyro_z -
-            gyro_z_offset
-        )
-        /
-        GYRO_LSB_PER_DPS;
-}
+    BSRR(GA)=(1U<<31);
 
-
-/* ============================================================
- * RATE PID DRY RUN
- * ============================================================ */
-
-static void virtual_rate_controller(void)
-{
-    float roll_error;
-    float pitch_error;
-    float yaw_error;
-
-    /*
-     * Setpoint for all axes = 0 dps
-     *
-     * error = setpoint - measured
-     */
-
-    roll_error =
-        -gyro_roll_dps;
-
-    pitch_error =
-        -gyro_pitch_dps;
-
-    yaw_error =
-        -gyro_yaw_dps;
-
-
-    pid_roll_output =
-        ROLL_KP *
-        roll_error;
-
-    pid_pitch_output =
-        PITCH_KP *
-        pitch_error;
-
-    pid_yaw_output =
-        YAW_KP *
-        yaw_error;
-
-
-    pid_roll_output =
-        clampf_local(
-            pid_roll_output,
-            -PID_LIMIT,
-            PID_LIMIT
-        );
-
-    pid_pitch_output =
-        clampf_local(
-            pid_pitch_output,
-            -PID_LIMIT,
-            PID_LIMIT
-        );
-
-    pid_yaw_output =
-        clampf_local(
-            pid_yaw_output,
-            -PID_LIMIT,
-            PID_LIMIT
-        );
-}
-
-
-/* ============================================================
- * CORRECTED VIRTUAL MOTOR MIXER
- * ============================================================ */
-
-static void virtual_motor_mixer(void)
-{
-    float m1;
-    float m2;
-    float m3;
-    float m4;
-
-    /*
-     *                  FRONT
-     *
-     *             M2          M1
-     *            CCW          CW
-     *
-     *
-     *             M3          M4
-     *             CW         CCW
-     *
-     *
-     * ========================================================
-     * ROLL
-     * ========================================================
-     *
-     * Positive R correction:
-     *
-     * M1 RIGHT FRONT  +
-     * M4 RIGHT REAR   +
-     *
-     * M2 LEFT FRONT   -
-     * M3 LEFT REAR    -
-     *
-     * This was corrected after ROLL dry-run.
-     *
-     *
-     * ========================================================
-     * PITCH
-     * ========================================================
-     *
-     * Positive P correction:
-     *
-     * M1 FRONT +
-     * M2 FRONT +
-     *
-     * M3 REAR  -
-     * M4 REAR  -
-     *
-     * This is the correction discovered by
-     * the PITCH dry-run.
-     *
-     *
-     * ========================================================
-     * YAW
-     * ========================================================
-     *
-     * CURRENT HYPOTHESIS:
-     *
-     * Positive Y correction:
-     *
-     * increase CW props:
-     *   M1 +
-     *   M3 +
-     *
-     * decrease CCW props:
-     *   M2 -
-     *   M4 -
-     *
-     * We are testing this NOW.
-     */
-
-    m1 =
-        TEST_BASE_THROTTLE
-        + pid_roll_output
-        + pid_pitch_output
-        + pid_yaw_output;
-
-    m2 =
-        TEST_BASE_THROTTLE
-        - pid_roll_output
-        + pid_pitch_output
-        - pid_yaw_output;
-
-    m3 =
-        TEST_BASE_THROTTLE
-        - pid_roll_output
-        - pid_pitch_output
-        + pid_yaw_output;
-
-    m4 =
-        TEST_BASE_THROTTLE
-        + pid_roll_output
-        - pid_pitch_output
-        - pid_yaw_output;
-
-
-    mix_m1_percent =
-        clampf_local(
-            m1,
-            0.0f,
-            100.0f
-        );
-
-    mix_m2_percent =
-        clampf_local(
-            m2,
-            0.0f,
-            100.0f
-        );
-
-    mix_m3_percent =
-        clampf_local(
-            m3,
-            0.0f,
-            100.0f
-        );
-
-    mix_m4_percent =
-        clampf_local(
-            m4,
-            0.0f,
-            100.0f
-        );
-}
-
-
-/* ============================================================
- * YAW DIAGNOSTIC
- * ============================================================ */
-
-static void yaw_diagnostic_update(void)
-{
-    static uint32_t diag_start_ms = 0U;
-    static uint32_t capture_start_ms = 0U;
-
-    float yaw_abs;
-    float roll_abs;
-    float pitch_abs;
-
-    float peak_abs;
-
-
-    /* ========================================================
-     * STATE 0
-     *
-     * Wait 1.5 sec before arming diagnostic.
-     * ======================================================== */
-
-    if (yaw_diag_state == 0U)
+    for(i=0U;i<count;i++)
     {
-        if (diag_start_ms == 0U)
+        uint8_t v=0U;
+
+        if(!spi_byte(tx[i],&v))
         {
-            diag_start_ms =
-                system_ms;
+            ok=0U;
+            break;
         }
 
-        if (
-            (uint32_t)(
-                system_ms -
-                diag_start_ms
-            )
-            >=
-            YAW_ARM_DELAY_MS
-        )
-        {
-            yaw_diag_state =
-                1U;
-        }
+        if(rx) rx[i]=v;
+    }
 
+    if(ok)
+        ok=spi_wait(1U<<7,0U);
+
+    BSRR(GA)=(1U<<15);
+
+    if(SPI_SR&(1U<<6))
+    {
+        volatile uint8_t d=SPI_DR8;
+        volatile uint32_t s=SPI_SR;
+        (void)d;
+        (void)s;
+        ok=0U;
+    }
+
+    if(!ok)
+        radio_spi_error_counter++;
+
+    return ok;
+}
+
+static uint32_t reg_write(
+    uint8_t address,
+    const uint8_t *data,
+    uint32_t count)
+{
+    uint8_t tx[11];
+    uint32_t i;
+
+    if(count==0U || count>10U)
+        return 0U;
+
+    tx[0]=(uint8_t)(0x20U|(address&0x1FU));
+
+    for(i=0U;i<count;i++)
+        tx[i+1U]=data[i];
+
+    return spi_xfer(tx,0,count+1U);
+}
+
+static uint32_t reg_wr1(uint8_t address,uint8_t value)
+{
+    return reg_write(address,&value,1U);
+}
+
+static uint32_t reg_read(uint8_t address,uint8_t *value)
+{
+    uint8_t tx[2]={
+        (uint8_t)(address&0x1FU),0xFFU
+    };
+    uint8_t rx[2];
+
+    if(!spi_xfer(tx,rx,2U))
+        return 0U;
+
+    *value=rx[1];
+    return 1U;
+}
+
+static uint32_t radio_cmd(uint8_t cmd)
+{
+    return spi_xfer(&cmd,0,1U);
+}
+
+static void radio_init(void)
+{
+    static const uint8_t regs[10]={
+        0x00,0x01,0x02,0x03,0x04,
+        0x05,0x06,0x11,0x1C,0x1D
+    };
+
+    static const uint8_t values[10]={
+        0x0C,0x00,0x01,0x03,0x00,
+        0x2D,0x07,0x09,0x00,0x00
+    };
+
+    static const uint8_t address[5]={
+        0xCC,0xCC,0xCC,0xCC,0xCC
+    };
+
+    uint32_t i;
+    uint8_t got=0U;
+
+    radio_rx_configured=0U;
+    radio_rx_config_error=0U;
+
+    BSRR(GB)=(1U<<22);
+
+    for(i=0U;i<10U;i++)
+    {
+        if(!reg_wr1(regs[i],values[i]) ||
+           !reg_read(regs[i],&got) ||
+           got!=values[i])
+        {
+            radio_rx_config_error=0x100U|regs[i];
+            return;
+        }
+    }
+
+    if(!reg_write(0x0A,address,5U))
+    {
+        radio_rx_config_error=0x10AU;
         return;
     }
 
-
-    /* ========================================================
-     * STATE 2
-     *
-     * Frozen result.
-     * ======================================================== */
-
-    if (yaw_diag_state == 2U)
+    if(!reg_write(0x10,address,5U))
     {
+        radio_rx_config_error=0x110U;
         return;
     }
 
-
-    yaw_abs =
-        absf_local(
-            gyro_yaw_dps
-        );
-
-    roll_abs =
-        absf_local(
-            gyro_roll_dps
-        );
-
-    pitch_abs =
-        absf_local(
-            gyro_pitch_dps
-        );
-
-
-    /* ========================================================
-     * WAIT FOR FIRST CLEAR YAW MOVEMENT
-     * ======================================================== */
-
-    if (yaw_diag_first_sign == 0)
+    if(!radio_cmd(0xE2U) ||
+       !reg_wr1(0x07U,0x70U))
     {
-        /*
-         * Require YAW to dominate.
-         *
-         * This prevents a roll/pitch movement from
-         * accidentally starting the test.
-         */
+        radio_rx_config_error=0x1E2U;
+        return;
+    }
 
-        if (
-            (yaw_abs >= YAW_TRIGGER_DPS)
-            &&
-            (yaw_abs > (roll_abs * 1.5f))
-            &&
-            (yaw_abs > (pitch_abs * 1.5f))
-        )
+    if(!reg_wr1(0x00U,0x0FU) ||
+       !reg_read(0x00U,&got) ||
+       got!=0x0FU)
+    {
+        radio_rx_config_error=0x200U;
+        return;
+    }
+
+    delay_ms(2U);
+
+    BSRR(GB)=(1U<<6);
+
+    radio_rx_configured=1U;
+}
+
+static void radio_accept(const uint8_t *data,uint32_t now)
+{
+    uint32_t i;
+    uint32_t sum=0x76U;
+    uint32_t seq=data[7];
+
+    for(i=0U;i<8U;i++)
+        sum+=data[i];
+
+    if((uint8_t)sum!=data[8] ||
+       data[0]>225U ||
+       data[1]>225U ||
+       data[2]>225U ||
+       data[3]>225U ||
+       data[4]!=0x05U ||
+       data[5]!=0x38U ||
+       data[6]!=0x00U)
+    {
+        radio_rx_invalid_packets++;
+        return;
+    }
+
+    if(radio_diag_alive && radio_have_seq)
+    {
+        uint32_t delta=(uint8_t)(
+            seq-previous_seq
+        );
+
+        if(delta==0U) return;
+
+        if(delta>=128U)
         {
-            if (gyro_yaw_dps > 0.0f)
-            {
-                yaw_diag_first_sign =
-                    1;
-            }
-            else
-            {
-                yaw_diag_first_sign =
-                    -1;
-            }
-
-
-            yaw_diag_first_gyro_dps =
-                gyro_yaw_dps;
-
-
-            yaw_diag_peak_gyro_dps =
-                gyro_yaw_dps;
-
-
-            yaw_diag_pid_at_peak =
-                pid_yaw_output;
-
-
-            yaw_diag_roll_pid_at_peak =
-                pid_roll_output;
-
-            yaw_diag_pitch_pid_at_peak =
-                pid_pitch_output;
-
-
-            yaw_diag_m1_at_peak =
-                mix_m1_percent;
-
-            yaw_diag_m2_at_peak =
-                mix_m2_percent;
-
-            yaw_diag_m3_at_peak =
-                mix_m3_percent;
-
-            yaw_diag_m4_at_peak =
-                mix_m4_percent;
-
-
-            capture_start_ms =
-                system_ms;
-
-
-            yaw_diag_capture_remaining_ms =
-                YAW_CAPTURE_MS;
+            radio_rx_invalid_packets++;
+            return;
         }
+    }
 
+    previous_seq=(uint8_t)seq;
+    radio_have_seq=1U;
+    radio_seen=1U;
+
+    radio_diag_last_seq=seq;
+
+    last_valid_radio_ms=now;
+    radio_diag_age_ms=0U;
+    radio_diag_alive=1U;
+
+    radio_diag_throttle=data[0];
+    radio_diag_yaw=data[1];
+    radio_diag_roll=data[2];
+    radio_diag_pitch=data[3];
+
+    radio_packets_received++;
+}
+
+static void radio_poll(uint32_t now)
+{
+    uint8_t status=0U;
+    uint8_t fifo=0U;
+    uint8_t tx[10];
+    uint8_t rx[10];
+    uint8_t packet[9];
+    uint32_t i;
+
+    if(!radio_rx_configured) return;
+
+    if((uint32_t)(now-last_radio_poll_ms)<RADIO_POLL_MS)
+        return;
+
+    last_radio_poll_ms=now;
+
+    if(!reg_read(0x07U,&status) ||
+       !reg_read(0x17U,&fifo))
+        return;
+
+    (void)status;
+
+    if(fifo&1U)
+        return;
+
+    tx[0]=0x61U;
+
+    for(i=1U;i<10U;i++)
+        tx[i]=0xFFU;
+
+    if(!spi_xfer(tx,rx,10U))
+        return;
+
+    for(i=0U;i<9U;i++)
+        packet[i]=rx[i+1U];
+
+    radio_accept(packet,now);
+
+    reg_wr1(0x07U,0x40U);
+}
+
+static void radio_link_update(uint32_t now)
+{
+    if(!radio_seen)
+    {
+        radio_diag_alive=0U;
+        radio_diag_age_ms=UINT32_MAX;
         return;
     }
 
+    radio_diag_age_ms=
+        (uint32_t)(now-last_valid_radio_ms);
 
-    /* ========================================================
-     * RECORD LARGEST YAW RATE
-     * ======================================================== */
-
-    peak_abs =
-        absf_local(
-            yaw_diag_peak_gyro_dps
-        );
-
-
-    if (yaw_abs > peak_abs)
+    if(radio_diag_alive &&
+       radio_diag_age_ms>=RADIO_TIMEOUT_MS)
     {
-        yaw_diag_peak_gyro_dps =
-            gyro_yaw_dps;
+        radio_diag_alive=0U;
+        radio_diag_lost_count++;
+        radio_have_seq=0U;
 
-
-        yaw_diag_pid_at_peak =
-            pid_yaw_output;
-
-
-        /*
-         * Also save roll/pitch PID contamination.
-         */
-
-        yaw_diag_roll_pid_at_peak =
-            pid_roll_output;
-
-        yaw_diag_pitch_pid_at_peak =
-            pid_pitch_output;
-
-
-        yaw_diag_m1_at_peak =
-            mix_m1_percent;
-
-        yaw_diag_m2_at_peak =
-            mix_m2_percent;
-
-        yaw_diag_m3_at_peak =
-            mix_m3_percent;
-
-        yaw_diag_m4_at_peak =
-            mix_m4_percent;
+        radio_diag_throttle=225U;
+        radio_diag_yaw=141U;
+        radio_diag_roll=112U;
+        radio_diag_pitch=112U;
     }
+}
 
+/* RADIO STICKS */
 
-    /* ========================================================
-     * CAPTURE TIMER
-     * ======================================================== */
+static float stick_axis(uint32_t raw,uint32_t middle)
+{
+    float value;
 
-    if (
-        (uint32_t)(
-            system_ms -
-            capture_start_ms
-        )
-        <
-        YAW_CAPTURE_MS
-    )
-    {
-        yaw_diag_capture_remaining_ms =
-            YAW_CAPTURE_MS -
-            (uint32_t)(
-                system_ms -
-                capture_start_ms
-            );
-    }
+    if(raw>225U) return 0.0f;
+
+    if(raw>=middle-3U && raw<=middle+3U)
+        return 0.0f;
+
+    if(raw>=middle)
+        value=(float)(raw-middle)/
+              (float)(225U-middle);
     else
+        value=-((float)(middle-raw)/
+                (float)middle);
+
+    return clampf(value,-1.0f,1.0f);
+}
+
+static void update_sticks(void)
+{
+    sim_throttle_percent=
+        (225.0f-(float)radio_diag_throttle)*
+        (100.0f/225.0f);
+
+    sim_roll_stick=
+        stick_axis(radio_diag_roll,112U);
+
+    sim_pitch_stick=
+        stick_axis(radio_diag_pitch,112U);
+
+    sim_yaw_stick=
+        stick_axis(radio_diag_yaw,141U);
+}
+
+/* REAL ARM / DISARM */
+
+static void disarm(uint32_t reason)
+{
+    motor_stop();
+
+    if(arm_state)
+        disarm_counter++;
+
+    arm_state=0U;
+    sim_arm_state=0U;
+
+    last_disarm_reason=reason;
+
+    arm_hold_active=0U;
+    disarm_hold_active=0U;
+
+    arm_gesture_progress_ms=0U;
+    disarm_gesture_progress_ms=0U;
+
+    if(fc_state!=FC_FAULT)
+        fc_state=FC_DISARMED;
+}
+
+static uint32_t near_u32(
+    uint32_t value,
+    uint32_t center,
+    uint32_t tolerance)
+{
+    return value>=center-tolerance &&
+           value<=center+tolerance;
+}
+
+static uint32_t arm_conditions_ok(void)
+{
+    if(fc_state!=FC_DISARMED)
+        return 0U;
+
+    if(fault_code!=0U ||
+       imu_ok!=1U ||
+       calibration_status!=2U ||
+       attitude_valid!=1U)
+        return 0U;
+
+    if(radio_diag_alive!=1U ||
+       radio_diag_age_ms>=RADIO_ARM_MAX_AGE_MS)
+        return 0U;
+
+    if(radio_diag_throttle<223U)
+        return 0U;
+
+    if(!near_u32(radio_diag_roll,112U,7U) ||
+       !near_u32(radio_diag_pitch,112U,7U))
+        return 0U;
+
+    if(radio_diag_yaw<ARM_YAW_RAW)
+        return 0U;
+
+    if(absf(attitude_roll_deg)>ARM_MAX_TILT_DEG ||
+       absf(attitude_pitch_deg)>ARM_MAX_TILT_DEG)
+        return 0U;
+
+    return 1U;
+}
+
+static void arm_update(uint32_t now)
+{
+    uint32_t request=disarm_request;
+    disarm_request=0U;
+
+    if(request)
     {
-        yaw_diag_capture_remaining_ms =
-            0U;
+        disarm(DISARM_DEBUG);
+        return;
+    }
 
+    if(fc_state==FC_FAULT)
+    {
+        motor_stop();
+        return;
+    }
 
-        /*
-         * Freeze.
-         */
+    if(arm_state)
+    {
+        if(radio_diag_alive!=1U ||
+           radio_diag_age_ms>=RADIO_TIMEOUT_MS)
+        {
+            disarm(DISARM_RADIO);
+            return;
+        }
 
-        yaw_diag_state =
-            2U;
+        if(imu_ok!=1U ||
+           calibration_status!=2U ||
+           attitude_valid!=1U)
+        {
+            disarm(DISARM_IMU);
+            return;
+        }
+
+        if(radio_diag_throttle>=223U &&
+           radio_diag_yaw<=DISARM_YAW_RAW)
+        {
+            if(!disarm_hold_active)
+            {
+                disarm_hold_active=1U;
+                disarm_hold_start_ms=now;
+            }
+
+            disarm_gesture_progress_ms=
+                (uint32_t)(now-disarm_hold_start_ms);
+
+            if(disarm_gesture_progress_ms>=DISARM_HOLD_MS)
+            {
+                disarm(DISARM_STICK);
+                return;
+            }
+        }
+        else
+        {
+            disarm_hold_active=0U;
+            disarm_gesture_progress_ms=0U;
+        }
+
+        return;
+    }
+
+    if(!arm_conditions_ok())
+    {
+        arm_hold_active=0U;
+        arm_gesture_progress_ms=0U;
+        return;
+    }
+
+    if(!arm_hold_active)
+    {
+        arm_hold_active=1U;
+        arm_hold_start_ms=now;
+    }
+
+    arm_gesture_progress_ms=
+        (uint32_t)(now-arm_hold_start_ms);
+
+    if(arm_gesture_progress_ms>=ARM_HOLD_MS)
+    {
+        arm_state=1U;
+        sim_arm_state=1U;
+        fc_state=FC_ARMED;
+
+        arm_counter++;
+
+        arm_hold_active=0U;
+        arm_gesture_progress_ms=0U;
+
+        motor_stop();
     }
 }
 
+/* REAL ANGLE-MODE MIXER */
 
-/* ============================================================
- * MAIN
- * ============================================================ */
+static void motor_control_update(void)
+{
+    float roll_target,pitch_target;
+    float roll_rate_target,pitch_rate_target;
+    float yaw_rate_target;
+
+    float r,p,y;
+    float base;
+    float m1,m2,m3,m4;
+
+    if(!arm_state || fc_state!=FC_ARMED)
+    {
+        motor_stop();
+        return;
+    }
+
+    if(radio_diag_alive!=1U ||
+       radio_diag_age_ms>=RADIO_TIMEOUT_MS ||
+       imu_ok!=1U ||
+       attitude_valid!=1U)
+    {
+        disarm(DISARM_RADIO);
+        return;
+    }
+
+    if(sim_throttle_percent<MOTOR_START_THR_PERCENT)
+    {
+        motor_stop();
+
+        mix_m1_percent=0.0f;
+        mix_m2_percent=0.0f;
+        mix_m3_percent=0.0f;
+        mix_m4_percent=0.0f;
+
+        return;
+    }
+
+    roll_target=MAX_ANGLE_DEG*sim_roll_stick;
+    pitch_target=MAX_ANGLE_DEG*sim_pitch_stick;
+
+    roll_rate_target=clampf(
+        ANGLE_KP*(roll_target-attitude_roll_deg),
+        -MAX_RATE_DPS,
+        MAX_RATE_DPS
+    );
+
+    pitch_rate_target=clampf(
+        ANGLE_KP*(pitch_target-attitude_pitch_deg),
+        -MAX_RATE_DPS,
+        MAX_RATE_DPS
+    );
+
+    yaw_rate_target=MAX_YAW_DPS*sim_yaw_stick;
+
+    r=clampf(
+        ROLL_KP*(roll_rate_target-gyro_roll_dps),
+        -MAX_CORRECTION_PERCENT,
+        MAX_CORRECTION_PERCENT
+    );
+
+    p=clampf(
+        PITCH_KP*(pitch_rate_target-gyro_pitch_dps),
+        -MAX_CORRECTION_PERCENT,
+        MAX_CORRECTION_PERCENT
+    );
+
+    y=clampf(
+        YAW_KP*(yaw_rate_target-gyro_yaw_dps),
+        -MAX_YAW_CORRECTION_PERCENT,
+        MAX_YAW_CORRECTION_PERCENT
+    );
+
+    pid_roll_output=r;
+    pid_pitch_output=p;
+    pid_yaw_output=y;
+
+    /*
+     * Active base motor duty:
+     * 15% at zero, up to 55% at full throttle.
+     */
+
+    base=15.0f+sim_throttle_percent*0.40f;
+
+    /*
+     * Existing Step 25 mixer conventions.
+     * Signs not validated for free flight.
+     *
+     * M1 front-right CW
+     * M2 front-left CCW
+     * M3 rear-left CW
+     * M4 rear-right CCW
+     */
+
+    m1=base+r+p+y;
+    m2=base-r+p-y;
+    m3=base-r-p+y;
+    m4=base+r-p-y;
+
+    m1=clampf(m1,0.0f,55.0f);
+    m2=clampf(m2,0.0f,55.0f);
+    m3=clampf(m3,0.0f,55.0f);
+    m4=clampf(m4,0.0f,55.0f);
+
+    mix_m1_percent=m1;
+    mix_m2_percent=m2;
+    mix_m3_percent=m3;
+    mix_m4_percent=m4;
+
+    motor_write(m1,m2,m3,m4);
+}
+
+/* MAIN */
 
 int main(void)
 {
-    uint32_t last_loop_ms;
+    uint32_t last_loop;
 
-    uint32_t now_ms;
-    uint32_t elapsed;
+    motor_stop();
 
-    uint32_t read_start;
-    uint32_t read_end;
+    reset_cause=RCC_CSR;
 
+    watchdog_reset_detected=
+        (reset_cause&(1U<<29))?1U:0U;
 
-    /* ========================================================
-     * GPIO CLOCKS
-     * ======================================================== */
+    RCC_CSR|=(1U<<24);
 
-    RCC_AHBENR |=
-        GPIOA_EN |
-        GPIOB_EN;
+    if(!clock_init())
+    {
+        fail(10U);
+        for(;;) motor_hardware_off();
+    }
 
-    (void)RCC_AHBENR;
+    if(!watchdog_init())
+    {
+        fail(11U);
+        for(;;) motor_hardware_off();
+    }
 
+    RCC_AHBENR|=(1U<<18);
 
-    /* ========================================================
-     * BOARD ENABLE PA1
-     * ======================================================== */
+    BSRR(GA)=(1U<<1);
+    OTYPER(GA)&=~(1U<<1);
 
-    gpio_high(
-        GPIOA_BASE,
-        1U
-    );
+    MODER(GA)=
+        (MODER(GA)&~(3U<<2))|
+        (1U<<2);
 
-    gpio_output(
-        GPIOA_BASE,
-        1U
-    );
-
-
-    /* ========================================================
-     * SAFE MOTOR PINS
-     * ======================================================== */
-
-    motor_gpio_prepare_low();
-
-
-    /* ========================================================
-     * TIME
-     * ======================================================== */
-
-    systick_init();
-
-    delay_ms(20U);
-
-
-    /* ========================================================
-     * TIM1
-     * ======================================================== */
-
-    tim1_init();
-
-    motor_all_off();
-
-
-    /* ========================================================
-     * I2C
-     * ======================================================== */
+    spi_init();
+    radio_init();
 
     i2c_init();
-
     delay_ms(20U);
 
+    load_level_calibration();
 
-    /* ========================================================
-     * M540
-     * ======================================================== */
-
-    if (m540_init() != 0U)
+    if(watchdog_reset_detected)
+        fail(8U);
+    else if(!imu_init())
     {
-        imu_ok =
-            1U;
+        imu_error_counter++;
+        fail(1U);
     }
     else
     {
-        imu_ok =
-            0U;
+        imu_ok=1U;
+        gyro_cal_start();
     }
 
+    motor_stop();
 
-    /* ========================================================
-     * CALIBRATION
-     *
-     * KEEP DRONE STILL.
-     * ======================================================== */
+    last_loop=system_ms;
 
-    if (imu_ok != 0U)
+    for(;;)
     {
-        if (gyro_calibrate() == 0U)
+        uint32_t now=system_ms;
+        uint32_t elapsed=
+            (uint32_t)(now-last_loop);
+
+        if(elapsed<LOOP_PERIOD_MS)
+            continue;
+
+        last_loop=now;
+
+        loop_counter++;
+        loop_dt_ms=elapsed;
+
+        if(elapsed>12U)
+            loop_overrun_counter++;
+
+        if(fc_state==FC_FAULT)
         {
-            imu_ok =
-                0U;
+            motor_stop();
         }
-    }
-
-
-    /* ========================================================
-     * RESET RUNTIME COUNTERS
-     * ======================================================== */
-
-    imu_frame_counter =
-        0U;
-
-    imu_error_counter =
-        0U;
-
-    imu_consecutive_errors =
-        0U;
-
-
-    /* ========================================================
-     * RESET YAW TEST
-     * ======================================================== */
-
-    yaw_diag_state =
-        0U;
-
-    yaw_diag_first_sign =
-        0;
-
-    yaw_diag_first_gyro_dps =
-        0.0f;
-
-    yaw_diag_peak_gyro_dps =
-        0.0f;
-
-    yaw_diag_pid_at_peak =
-        0.0f;
-
-    yaw_diag_roll_pid_at_peak =
-        0.0f;
-
-    yaw_diag_pitch_pid_at_peak =
-        0.0f;
-
-    yaw_diag_m1_at_peak =
-        0.0f;
-
-    yaw_diag_m2_at_peak =
-        0.0f;
-
-    yaw_diag_m3_at_peak =
-        0.0f;
-
-    yaw_diag_m4_at_peak =
-        0.0f;
-
-    yaw_diag_capture_remaining_ms =
-        0U;
-
-
-    /* ========================================================
-     * ABSOLUTE MOTOR LOCK
-     * ======================================================== */
-
-    physical_motor_lock =
-        1U;
-
-    motor_all_off();
-
-
-    /* ========================================================
-     * MAIN LOOP
-     * ======================================================== */
-
-    last_loop_ms =
-        system_ms;
-
-
-    while (1)
-    {
-        now_ms =
-            system_ms;
-
-
-        elapsed =
-            (uint32_t)(
-                now_ms -
-                last_loop_ms
-            );
-
-
-        if (elapsed >= LOOP_PERIOD_MS)
+        else
         {
-            last_loop_ms =
-                now_ms;
-
-
-            /* ================================================
-             * LOOP TIMING
-             * ================================================ */
-
-            loop_dt_ms =
-                elapsed;
-
-
-            loop_dt =
-                (float)elapsed *
-                0.001f;
-
-
-            if (loop_dt > 0.0f)
+            if(elapsed>25U)
             {
-                loop_hz =
-                    1.0f /
-                    loop_dt;
+                disarm(DISARM_TIMING);
             }
 
-
-            if (elapsed > loop_dt_max_ms)
+            if(!imu_sample())
             {
-                loop_dt_max_ms =
-                    elapsed;
-            }
-
-
-            /* ================================================
-             * IMU
-             * ================================================ */
-
-            read_start =
-                system_ms;
-
-
-            if (m540_read_raw() != 0U)
-            {
-                imu_ok =
-                    1U;
-
-
-                imu_consecutive_errors =
-                    0U;
-
-
-                /* ============================================
-                 * RAW GYRO -> deg/s
-                 * ============================================ */
-
-                gyro_update();
-
-
-                /* ============================================
-                 * RATE PID
-                 * ============================================ */
-
-                virtual_rate_controller();
-
-
-                /* ============================================
-                 * VIRTUAL MIXER
-                 * ============================================ */
-
-                virtual_motor_mixer();
-
-
-                /* ============================================
-                 * YAW RECORDER
-                 * ============================================ */
-
-                yaw_diagnostic_update();
+                imu_ok=0U;
+                imu_error_counter++;
+                fail(3U);
             }
             else
             {
-                imu_ok =
-                    0U;
+                imu_ok=1U;
 
+                if(fc_state==FC_CALIBRATING)
+                    gyro_cal_update();
 
-                imu_error_counter++;
+                if(calibration_status==2U)
+                    attitude_update(elapsed);
 
-                imu_consecutive_errors++;
-
-
-                /*
-                 * Safe virtual state too.
-                 */
-
-                pid_roll_output =
-                    0.0f;
-
-                pid_pitch_output =
-                    0.0f;
-
-                pid_yaw_output =
-                    0.0f;
-
-
-                mix_m1_percent =
-                    0.0f;
-
-                mix_m2_percent =
-                    0.0f;
-
-                mix_m3_percent =
-                    0.0f;
-
-                mix_m4_percent =
-                    0.0f;
+                if(fc_state==FC_ARMED &&
+                   attitude_tilt_cutoff)
+                {
+                    disarm(DISARM_TILT);
+                }
             }
-
-
-            read_end =
-                system_ms;
-
-
-            imu_read_time_ms =
-                (uint32_t)(
-                    read_end -
-                    read_start
-                );
-
-
-            if (
-                imu_read_time_ms >
-                imu_read_time_max_ms
-            )
-            {
-                imu_read_time_max_ms =
-                    imu_read_time_ms;
-            }
-
-
-            /* ================================================
-             * ABSOLUTE PHYSICAL MOTOR LOCK
-             *
-             * ALWAYS EXECUTED.
-             * ================================================ */
-
-            physical_motor_lock =
-                1U;
-
-
-            motor_all_off();
-
-
-            i2c_isr_debug =
-                I2C1_ISR;
-
-            i2c_timingr_debug =
-                I2C1_TIMINGR;
         }
+
+        radio_poll(system_ms);
+        radio_link_update(system_ms);
+        update_sticks();
+
+        arm_update(system_ms);
+
+        if(fc_state==FC_ARMED &&
+           radio_diag_age_ms<RADIO_TIMEOUT_MS &&
+           imu_ok==1U &&
+           attitude_valid==1U)
+        {
+            motor_control_update();
+        }
+        else
+        {
+            motor_stop();
+        }
+
+        watchdog_feed();
     }
 }
