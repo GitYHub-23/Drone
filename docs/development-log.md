@@ -447,3 +447,7 @@ Today, I was just repeating past works to ensure that new nRF24L01+ work great. 
 
 Today I started working on safety systems. The radiomodules nRF24L01+ were working great and transferred data without errors. I solved the 
 problem like when the controller is out of electricity or the batteries run out, it will stop the drone and will not move until the controller will not have enough energy.
+
+## 27 November 2026
+
+Right now I am waiting for a new accumulator, because the one that i bought was defective. I just have to test that the drone flies good, and everything else looks looks fine, idk. I hope it will fly. The approximate time is 3-4 December.
